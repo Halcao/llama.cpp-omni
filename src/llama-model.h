@@ -387,6 +387,29 @@ struct llama_layer {
     struct ggml_tensor * ffn_act_beta    = nullptr;
     struct ggml_tensor * ffn_act_eps     = nullptr;
 
+    // awq tensors
+    struct ggml_tensor * wq_awq_qweight       = nullptr;
+    struct ggml_tensor * wq_awq_qzeros        = nullptr;
+    struct ggml_tensor * wq_awq_scale         = nullptr;
+    struct ggml_tensor * wk_awq_qweight       = nullptr;
+    struct ggml_tensor * wk_awq_qzeros        = nullptr;
+    struct ggml_tensor * wk_awq_scale         = nullptr;
+    struct ggml_tensor * wv_awq_qweight       = nullptr;
+    struct ggml_tensor * wv_awq_qzeros        = nullptr;
+    struct ggml_tensor * wv_awq_scale         = nullptr;
+    struct ggml_tensor * wo_awq_qweight       = nullptr;
+    struct ggml_tensor * wo_awq_qzeros        = nullptr;
+    struct ggml_tensor * wo_awq_scale         = nullptr;
+    struct ggml_tensor * ffn_gate_awq_qweight = nullptr;
+    struct ggml_tensor * ffn_gate_awq_qzeros  = nullptr;
+    struct ggml_tensor * ffn_gate_awq_scale   = nullptr;
+    struct ggml_tensor * ffn_up_awq_qweight   = nullptr;
+    struct ggml_tensor * ffn_up_awq_qzeros    = nullptr;
+    struct ggml_tensor * ffn_up_awq_scale     = nullptr;
+    struct ggml_tensor * ffn_down_awq_qweight = nullptr;
+    struct ggml_tensor * ffn_down_awq_qzeros  = nullptr;
+    struct ggml_tensor * ffn_down_awq_scale   = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;

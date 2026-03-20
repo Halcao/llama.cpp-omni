@@ -25,6 +25,16 @@
 #include <sstream>
 #include <stdexcept>
 
+static llama_quantization_method llama_quantization_method_from_string(const std::string & name) {
+    if (name == "awq") {
+        return LLAMA_QUANTIZATION_METHOD_AWQ;
+    }
+    if (name == "gptq") {
+        return LLAMA_QUANTIZATION_METHOD_GPTQ;
+    }
+    return LLAMA_QUANTIZATION_METHOD_NONE;
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -1002,8 +1012,14 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             } break;
         case LLM_ARCH_QWEN3:
             {
+                std::string quant_method;
                 ml.get_key(LLM_KV_POOLING_TYPE, hparams.pooling_type, false);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_QUANTIZATION_METHOD,     quant_method,             false);
+                ml.get_key(LLM_KV_QUANTIZATION_BITS,       hparams.quant_bits,       false);
+                ml.get_key(LLM_KV_QUANTIZATION_GROUP_SIZE, hparams.quant_group_size, false);
+                ml.get_key(LLM_KV_QUANTIZATION_ZERO_POINT, hparams.quant_zero_point, false);
+                hparams.quant_method = llama_quantization_method_from_string(quant_method);
                 switch (hparams.n_layer) {
                     case 28: type = hparams.n_embd == 1024 ? LLM_TYPE_0_6B : LLM_TYPE_1_7B; break;
                     case 36: type = hparams.n_embd == 2560 ? LLM_TYPE_4B : LLM_TYPE_8B; break;
@@ -3262,6 +3278,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 } break;
             case LLM_ARCH_QWEN3:
                 {
+                    const bool is_awq_qwen3 =
+                        hparams.quant_method == LLAMA_QUANTIZATION_METHOD_AWQ &&
+                        hparams.quant_bits > 0 &&
+                        hparams.quant_group_size > 0;
+                    const uint32_t awq_pack_factor = is_awq_qwen3 ? 32u / hparams.quant_bits : 0u;
+                    const int awq_weight_flags = is_awq_qwen3 ? TENSOR_NOT_REQUIRED : 0;
+
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
                     // output
@@ -3278,20 +3301,62 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     for (int i = 0; i < n_layer; ++i) {
                         auto & layer = layers[i];
 
+                        auto create_awq_tensor_triplet = [&](ggml_tensor *& qweight, ggml_tensor *& qzeros, ggml_tensor *& scales,
+                                                             llm_tensor qweight_id, llm_tensor qzeros_id, llm_tensor scales_id,
+                                                             int64_t in_features, int64_t out_features) {
+                            if (!is_awq_qwen3) {
+                                return;
+                            }
+
+                            GGML_ASSERT(awq_pack_factor > 0);
+                            GGML_ASSERT(in_features % hparams.quant_group_size == 0);
+                            GGML_ASSERT(out_features % awq_pack_factor == 0);
+
+                            const int64_t n_groups = in_features / hparams.quant_group_size;
+                            const int64_t packed_out_features = out_features / awq_pack_factor;
+
+                            qweight = create_tensor(tn(qweight_id, "weight", i), {in_features, packed_out_features}, TENSOR_NOT_REQUIRED);
+                            qzeros  = create_tensor(tn(qzeros_id,  "weight", i), {n_groups, packed_out_features}, TENSOR_NOT_REQUIRED);
+                            scales  = create_tensor(tn(scales_id,  "weight", i), {n_groups, out_features},        TENSOR_NOT_REQUIRED);
+                        };
+
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
-                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
-                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa}, 0);
-                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa}, 0);
-                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, awq_weight_flags);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa},             awq_weight_flags);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa},             awq_weight_flags);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, awq_weight_flags);
+
+                        create_awq_tensor_triplet(layer.wq_awq_qweight, layer.wq_awq_qzeros, layer.wq_awq_scale,
+                                LLM_TENSOR_ATTN_Q_AWQ_QWEIGHT, LLM_TENSOR_ATTN_Q_AWQ_QZEROS, LLM_TENSOR_ATTN_Q_AWQ_SCALES,
+                                n_embd, n_embd_head_k * n_head);
+                        create_awq_tensor_triplet(layer.wk_awq_qweight, layer.wk_awq_qzeros, layer.wk_awq_scale,
+                                LLM_TENSOR_ATTN_K_AWQ_QWEIGHT, LLM_TENSOR_ATTN_K_AWQ_QZEROS, LLM_TENSOR_ATTN_K_AWQ_SCALES,
+                                n_embd, n_embd_gqa);
+                        create_awq_tensor_triplet(layer.wv_awq_qweight, layer.wv_awq_qzeros, layer.wv_awq_scale,
+                                LLM_TENSOR_ATTN_V_AWQ_QWEIGHT, LLM_TENSOR_ATTN_V_AWQ_QZEROS, LLM_TENSOR_ATTN_V_AWQ_SCALES,
+                                n_embd, n_embd_gqa);
+                        create_awq_tensor_triplet(layer.wo_awq_qweight, layer.wo_awq_qzeros, layer.wo_awq_scale,
+                                LLM_TENSOR_ATTN_OUT_AWQ_QWEIGHT, LLM_TENSOR_ATTN_OUT_AWQ_QZEROS, LLM_TENSOR_ATTN_OUT_AWQ_SCALES,
+                                n_embd_head_k * n_head, n_embd);
 
                         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
                         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
 
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, awq_weight_flags);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, awq_weight_flags);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, awq_weight_flags);
+
+                        create_awq_tensor_triplet(layer.ffn_gate_awq_qweight, layer.ffn_gate_awq_qzeros, layer.ffn_gate_awq_scale,
+                                LLM_TENSOR_FFN_GATE_AWQ_QWEIGHT, LLM_TENSOR_FFN_GATE_AWQ_QZEROS, LLM_TENSOR_FFN_GATE_AWQ_SCALES,
+                                n_embd, n_ff);
+                        create_awq_tensor_triplet(layer.ffn_down_awq_qweight, layer.ffn_down_awq_qzeros, layer.ffn_down_awq_scale,
+                                LLM_TENSOR_FFN_DOWN_AWQ_QWEIGHT, LLM_TENSOR_FFN_DOWN_AWQ_QZEROS, LLM_TENSOR_FFN_DOWN_AWQ_SCALES,
+                                n_ff, n_embd);
+                        create_awq_tensor_triplet(layer.ffn_up_awq_qweight, layer.ffn_up_awq_qzeros, layer.ffn_up_awq_scale,
+                                LLM_TENSOR_FFN_UP_AWQ_QWEIGHT, LLM_TENSOR_FFN_UP_AWQ_QZEROS, LLM_TENSOR_FFN_UP_AWQ_SCALES,
+                                n_embd, n_ff);
                     }
                 } break;
             case LLM_ARCH_QWEN3MOE:

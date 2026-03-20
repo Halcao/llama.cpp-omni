@@ -208,45 +208,40 @@ int main() {
     CUDA_CHECK(cudaMemset(d_c, 0, m * n * sizeof(__half)));
     CUDA_CHECK(cudaMemset(d_workspace, 0, workspace_elems * sizeof(int)));
 
-    ggml_cuda_marlin_gemm_params params = {};
-    params.a = d_a;
-    params.b_q_weight = d_b;
-    params.c = d_c;
-    params.c_tmp = nullptr;
-    params.b_bias = nullptr;
-    params.a_scales = nullptr;
-    params.b_scales = d_scales;
-    params.global_scale = nullptr;
-    params.b_zeros = nullptr;
-    params.g_idx = nullptr;
-    params.perm = nullptr;
-    params.a_tmp = nullptr;
-    params.workspace = d_workspace;
-    params.size_m = m;
-    params.size_n = n;
-    params.size_k = k;
-    params.lda = k;
-    params.num_groups = num_groups;
-    params.group_size = group_size;
-    params.device = device;
-    params.stream = nullptr;
-    params.sms = workspace_elems;
-    params.thread_k = -1;
-    params.thread_n = -1;
-    params.a_type = GGML_CUDA_MARLIN_TYPE_F16;
-    params.b_type = GGML_CUDA_MARLIN_TYPE_U4B8;
-    params.c_type = GGML_CUDA_MARLIN_TYPE_F16;
-    params.s_type = GGML_CUDA_MARLIN_TYPE_F16;
-    params.has_bias = false;
-    params.has_act_order = false;
-    params.is_k_full = true;
-    params.has_zp = false;
-    params.use_atomic_add = false;
-    params.use_fp32_reduce = false;
-    params.is_zp_float = false;
+    ggml_init_params ggml_params = {
+        /*.mem_size   =*/ 1 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(ggml_params);
+    if (ctx == nullptr) {
+        std::cerr << "ggml_init failed\n";
+        return 1;
+    }
 
-    if (!ggml_cuda_marlin_gemm(&params)) {
-        std::cerr << "ggml_cuda_marlin_gemm returned false\n";
+    ggml_tensor * a_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, m);
+    ggml_tensor * b_qweight_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, n / kPackFactor);
+    ggml_tensor * b_scales_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, num_groups, n);
+    ggml_tensor * c_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, m);
+    ggml_tensor * workspace_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, workspace_elems);
+
+    a_tensor->data = d_a;
+    b_qweight_tensor->data = d_b;
+    b_scales_tensor->data = d_scales;
+    c_tensor->data = d_c;
+    workspace_tensor->data = d_workspace;
+
+    if (!ggml_cuda_marlin_w4a16_gemm(
+                a_tensor,
+                b_qweight_tensor,
+                b_scales_tensor,
+                nullptr,
+                c_tensor,
+                workspace_tensor,
+                device,
+                nullptr)) {
+        std::cerr << "ggml_cuda_marlin_w4a16_gemm returned false\n";
+        ggml_free(ctx);
         return 1;
     }
 
@@ -271,6 +266,7 @@ int main() {
     CUDA_CHECK(cudaFree(d_scales));
     CUDA_CHECK(cudaFree(d_b));
     CUDA_CHECK(cudaFree(d_a));
+    ggml_free(ctx);
 
     std::cout << "Marlin W4A16 GEMM test passed, max_abs_err=" << max_abs_err << '\n';
     return 0;
