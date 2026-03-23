@@ -541,6 +541,10 @@ public:
     omni_context * octx = nullptr;
     std::mutex            octx_mutex;
 
+    // Omni 的 omni_init 会把指针存进 omni_context->params，必须指向长期存活的对象。
+    // 不能用 HTTP 回调栈上的局部 common_params（请求返回后即悬空）。
+    common_params omni_params;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -4224,7 +4228,7 @@ void server_routes::init_routes() {
             res->error(format_error_response("\"msg_type\" or \"media_type\" must be provided as integer (1=audio, 2=omni)", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        common_params params_mut = params;
+        ctx_server.omni_params = params;
         const bool    use_tts = json_value(data, "use_tts", true);
         const bool    duplex_mode = json_value(data, "duplex_mode", false);
         std::string model_dir = json_value(data, "model_dir", std::string("./tools/omni/convert/gguf/"));
@@ -4233,20 +4237,20 @@ void server_routes::init_routes() {
         std::string token2wav_device = json_value(data, "token2wav_device", std::string("gpu:1"));
         std::string output_dir = json_value(data, "output_dir", std::string("./tools/omni/output"));
         const int   n_predict = json_value(data, "n_predict", 2048);
-        params_mut.n_predict = n_predict;
+        ctx_server.omni_params.n_predict = n_predict;
         if (!model_dir.empty() && model_dir.back() != '/') {
             model_dir += '/';
         }
-        params_mut.vpm_model = model_dir + "vision/MiniCPM-o-4_5-vision-F16.gguf";
-        params_mut.apm_model = model_dir + "audio/MiniCPM-o-4_5-audio-F16.gguf";
-        params_mut.tts_model = model_dir + "tts/MiniCPM-o-4_5-tts-F16.gguf";
+        ctx_server.omni_params.vpm_model = model_dir + "vision/MiniCPM-o-4_5-vision-F16.gguf";
+        ctx_server.omni_params.apm_model = model_dir + "audio/MiniCPM-o-4_5-audio-F16.gguf";
+        ctx_server.omni_params.tts_model = model_dir + "tts/MiniCPM-o-4_5-tts-F16.gguf";
         std::string vision_backend = json_value(data, "vision_backend", std::string("metal"));
         if (vision_backend == "coreml") {
             std::string vision_coreml = json_value(data, "vision_coreml_model_path",
                 std::string(model_dir + "vision/coreml_minicpmo45_vit_all_f16.mlmodelc"));
-            params_mut.vision_coreml_model_path = vision_coreml;
+            ctx_server.omni_params.vision_coreml_model_path = vision_coreml;
         } else {
-            params_mut.vision_coreml_model_path = "";
+            ctx_server.omni_params.vision_coreml_model_path = "";
         }
         {
             std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
@@ -4254,7 +4258,7 @@ void server_routes::init_routes() {
                 omni_free(ctx_server.octx);
                 ctx_server.octx = nullptr;
             }
-            ctx_server.octx = omni_init(&params_mut, media_type, use_tts, tts_bin_dir, tts_gpu_layers, token2wav_device, duplex_mode,
+            ctx_server.octx = omni_init(&ctx_server.omni_params, media_type, use_tts, tts_bin_dir, tts_gpu_layers, token2wav_device, duplex_mode,
                                         ctx_server.model, ctx_server.ctx, output_dir);
             if (ctx_server.octx == nullptr) {
                 res->error(format_error_response("omni_init failed", ERROR_TYPE_SERVER));
