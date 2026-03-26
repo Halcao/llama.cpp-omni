@@ -274,6 +274,60 @@ static void llama_rehome_tensor_to_cuda(
     owned_buffers.emplace_back(std::move(dst_buf));
 }
 
+static void llama_restore_awq_tensor_layout_to_hf_2d(
+        ggml_tensor * tensor,
+        ggml_backend_t backend,
+        std::vector<ggml_backend_buffer_ptr> & owned_buffers) {
+    GGML_ASSERT(tensor != nullptr);
+    GGML_ASSERT(backend != nullptr);
+    GGML_ASSERT(tensor->ne[2] == 1 && tensor->ne[3] == 1);
+
+    const int64_t rows = tensor->ne[0];
+    const int64_t cols = tensor->ne[1];
+    const int64_t count = rows * cols;
+
+    if (count <= 0) {
+        return;
+    }
+
+    ggml_tensor dst = *tensor;
+    ggml_backend_buffer_ptr dst_buf { ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(backend), ggml_nbytes(&dst)) };
+    if (!dst_buf) {
+        throw std::runtime_error(format("%s: failed to allocate buffer for tensor '%s'", __func__, ggml_get_name(tensor)));
+    }
+    dst.buffer = dst_buf.get();
+    dst.data = ggml_backend_buffer_get_base(dst_buf.get());
+
+    if (tensor->type == GGML_TYPE_I32) {
+        std::vector<int32_t> src(count);
+        std::vector<int32_t> reordered(count);
+        ggml_backend_tensor_get(tensor, src.data(), 0, ggml_nbytes(tensor));
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t c = 0; c < cols; ++c) {
+                reordered[r * cols + c] = src[c * rows + r];
+            }
+        }
+        ggml_backend_tensor_set(&dst, reordered.data(), 0, ggml_nbytes(&dst));
+    } else if (tensor->type == GGML_TYPE_F32) {
+        std::vector<float> src(count);
+        std::vector<float> reordered(count);
+        ggml_backend_tensor_get(tensor, src.data(), 0, ggml_nbytes(tensor));
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t c = 0; c < cols; ++c) {
+                reordered[r * cols + c] = src[c * rows + r];
+            }
+        }
+        ggml_backend_tensor_set(&dst, reordered.data(), 0, ggml_nbytes(&dst));
+    } else {
+        throw std::runtime_error(format("%s: unsupported tensor type '%s' for tensor '%s'",
+                __func__, ggml_type_name(tensor->type), ggml_get_name(tensor)));
+    }
+
+    tensor->buffer = dst_buf.get();
+    tensor->data = dst.data;
+    owned_buffers.emplace_back(std::move(dst_buf));
+}
+
 static void llama_permute_awq_scales_to_cuda(
         ggml_tensor * scales,
         int64_t size_k,
@@ -386,6 +440,7 @@ static void llama_convert_awq_qzeros_to_marlin_cuda(
          7, 15, 23, 31, 39, 47, 55, 63,
     };
     static constexpr std::array<int, 8> k_awq_interleave = { 0, 2, 4, 6, 1, 3, 5, 7 };
+    static constexpr std::array<int, 8> k_awq_undo_interleave = { 0, 4, 1, 5, 2, 6, 3, 7 };
 
     GGML_ASSERT(qzeros != nullptr);
     GGML_ASSERT(backend != nullptr);
@@ -412,9 +467,23 @@ static void llama_convert_awq_qzeros_to_marlin_cuda(
         }
     }
 
-    std::vector<uint32_t> marlin_permuted(unpacked.size());
+    // Strict vLLM awq_to_marlin_zero_points path:
+    // unpack -> undo interleave -> scale perm -> interleave -> repack.
+    std::vector<uint32_t> awq_uninterleaved(unpacked.size());
     for (int64_t row = 0; row < rows; ++row) {
         const uint32_t * src = unpacked.data() + row * size_n;
+        uint32_t * dst = awq_uninterleaved.data() + row * size_n;
+
+        for (int64_t base = 0; base < size_n; base += (int64_t) k_awq_undo_interleave.size()) {
+            for (size_t i = 0; i < k_awq_undo_interleave.size(); ++i) {
+                dst[base + (int64_t) i] = src[base + (int64_t) k_awq_undo_interleave[i]];
+            }
+        }
+    }
+
+    std::vector<uint32_t> marlin_permuted(awq_uninterleaved.size());
+    for (int64_t row = 0; row < rows; ++row) {
+        const uint32_t * src = awq_uninterleaved.data() + row * size_n;
         uint32_t * dst = marlin_permuted.data() + row * size_n;
 
         for (int64_t base = 0; base < size_n; base += (int64_t) k_scale_perm.size()) {
@@ -530,6 +599,12 @@ static void llama_repack_qwen3_awq_tensors_to_marlin(llama_model & model, std::v
 
         int device = 0;
         ggml_backend_ptr backend { llama_init_cuda_backend_for_tensor(qweight, &device) };
+
+        // AWQ triplets were exported with .T to satisfy gguf/ggml shape semantics.
+        // Restore to the original HF logical layout before applying vLLM marlin transforms.
+        llama_restore_awq_tensor_layout_to_hf_2d(qweight, backend.get(), owned_buffers);
+        llama_restore_awq_tensor_layout_to_hf_2d(qzeros,  backend.get(), owned_buffers);
+        llama_restore_awq_tensor_layout_to_hf_2d(scales,  backend.get(), owned_buffers);
 
         llama_repack_awq_qweight_for_marlin(qweight, scales, model.hparams.quant_bits, owned_buffers);
         llama_convert_awq_qzeros_to_marlin_cuda(
