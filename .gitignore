@@ -136,6 +136,11 @@ zig-cache/
 ppl-*.txt
 qnt-*.txt
 perf-*.txt
+awq_*_dump*/
+awq_*_full_dump*/
+awq_*_debug*/
+awq_*_dump*.bin
+awq_*_dump*.meta
 
 # Examples
 
