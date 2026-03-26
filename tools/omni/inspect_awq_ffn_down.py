@@ -337,16 +337,20 @@ def make_weight_variants(
         ).astype(np.float32),
     }
     qparam_group_variants = {
-        "g0": (0, scales.astype(np.float32)),
-        "g-1": (-1, shift_group_axis(scales, -1).astype(np.float32)),
-        "g+1": (1, shift_group_axis(scales, 1).astype(np.float32)),
+        "sg0_zg0": (0, 0, scales.astype(np.float32)),
+        "sg-1_zg-1": (-1, -1, shift_group_axis(scales, -1).astype(np.float32)),
+        "sg+1_zg+1": (1, 1, shift_group_axis(scales, 1).astype(np.float32)),
+        "sg0_zg-1": (0, -1, scales.astype(np.float32)),
+        "sg0_zg+1": (0, 1, scales.astype(np.float32)),
+        "sg-1_zg0": (-1, 0, shift_group_axis(scales, -1).astype(np.float32)),
+        "sg+1_zg0": (1, 0, shift_group_axis(scales, 1).astype(np.float32)),
     }
     variants: list[WeightVariant] = []
 
     for qweight_name, qweight_variant in qweight_variants.items():
         for qzeros_name, qzeros_u4 in qzeros_variants.items():
-            for group_name, (group_offset, scales_variant) in qparam_group_variants.items():
-                qzeros_variant = shift_group_axis(qzeros_u4, group_offset).astype(np.float32)
+            for group_name, (scale_group_offset, zp_group_offset, scales_variant) in qparam_group_variants.items():
+                qzeros_variant = shift_group_axis(qzeros_u4, zp_group_offset).astype(np.float32)
                 repeated_qzeros = np.repeat(qzeros_variant, group_size, axis=0)
                 repeated_scales = np.repeat(scales_variant, group_size, axis=0)
                 variants.append(
@@ -354,7 +358,8 @@ def make_weight_variants(
                         name=f"{qweight_name}:{qzeros_name}:{group_name}:awq_zp",
                         description=(
                             f"{qweight_name} qweight, {qzeros_name} qzeros, "
-                            f"group_offset={group_offset}, weight=(q-zp)*scale"
+                            f"scale_group_offset={scale_group_offset}, "
+                            f"zp_group_offset={zp_group_offset}, weight=(q-zp)*scale"
                         ),
                         qweight_u4=qweight_variant,
                         qzeros_u4=qzeros_variant,
@@ -367,7 +372,8 @@ def make_weight_variants(
                         name=f"{qweight_name}:{qzeros_name}:{group_name}:awq_zp_plus_1",
                         description=(
                             f"{qweight_name} qweight, {qzeros_name} qzeros, "
-                            f"group_offset={group_offset}, weight=(q-(zp+1))*scale"
+                            f"scale_group_offset={scale_group_offset}, "
+                            f"zp_group_offset={zp_group_offset}, weight=(q-(zp+1))*scale"
                         ),
                         qweight_u4=qweight_variant,
                         qzeros_u4=qzeros_variant,
@@ -378,8 +384,8 @@ def make_weight_variants(
 
         variants.append(
             WeightVariant(
-                name=f"{qweight_name}:g0:symmetric_u4b8",
-                description=f"{qweight_name} qweight, ignore qzeros, group_offset=0, weight=(q-8)*scale",
+                name=f"{qweight_name}:sg0_zg0:symmetric_u4b8",
+                description=f"{qweight_name} qweight, ignore qzeros, scale_group_offset=0, zp_group_offset=0, weight=(q-8)*scale",
                 qweight_u4=qweight_variant,
                 qzeros_u4=qzeros_u4_plain.astype(np.float32),
                 scales=scales.astype(np.float32),
@@ -509,7 +515,7 @@ def main() -> int:
     qzeros_u4_plain = unpack_u4_cols(qzeros_packed, num_groups, size_n)
     weight_variants = make_weight_variants(qweight_u4, qzeros_u4_plain, scales, group_size)
     baseline_variant = next(
-        variant for variant in weight_variants if variant.name == "plain:plain:g0:awq_zp"
+        variant for variant in weight_variants if variant.name == "plain:plain:sg0_zg0:awq_zp"
     )
     weight_f32 = baseline_variant.weight_f32
 
