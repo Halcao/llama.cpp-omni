@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Comni</string>
+    <key>CFBundleDisplayName</key>
+    <string>Comni</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.comni.app</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleExecutable</key>
+    <string>Comni</string>
+    <key>CFBundleIconFile</key>
+    <string>Comni</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSUIElement</key>
+    <false/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Comni needs microphone access for voice conversations.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Comni needs camera access for video conversations.</string>
+</dict>
+</plist>

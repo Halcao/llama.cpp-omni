@@ -1,0 +1,50 @@
+{
+    "version": 1,
+    "models": [
+        {
+            "id": "minicpm-o-4.5",
+            "display_name": "MiniCPM-o 4.5",
+            "hf_repo": "openbmb/MiniCPM-o-4_5-gguf",
+            "description": "9B multimodal model — vision, speech, full-duplex streaming",
+            "dir_name": "MiniCPM-o-4_5-gguf",
+            "llm_variants": [
+                {"file": "MiniCPM-o-4_5-Q4_K_M.gguf", "quant": "Q4_K_M", "size": 5026714400, "recommended": true},
+                {"file": "MiniCPM-o-4_5-Q4_K_S.gguf", "quant": "Q4_K_S", "size": 4800942880},
+                {"file": "MiniCPM-o-4_5-Q4_0.gguf",   "quant": "Q4_0",   "size": 4773679904},
+                {"file": "MiniCPM-o-4_5-Q4_1.gguf",   "quant": "Q4_1",   "size": 5246637856},
+                {"file": "MiniCPM-o-4_5-Q5_K_M.gguf", "quant": "Q5_K_M", "size": 5849946912},
+                {"file": "MiniCPM-o-4_5-Q5_K_S.gguf", "quant": "Q5_K_S", "size": 5719595808},
+                {"file": "MiniCPM-o-4_5-Q5_0.gguf",   "quant": "Q5_0",   "size": 5719595808},
+                {"file": "MiniCPM-o-4_5-Q5_1.gguf",   "quant": "Q5_1",   "size": 6192553760},
+                {"file": "MiniCPM-o-4_5-Q6_K.gguf",   "quant": "Q6_K",   "size": 6724631456},
+                {"file": "MiniCPM-o-4_5-Q8_0.gguf",   "quant": "Q8_0",   "size": 8707877536},
+                {"file": "MiniCPM-o-4_5-F16.gguf",    "quant": "F16",    "size": 16384959136}
+            ],
+            "required_files": [
+                {"path": "audio/MiniCPM-o-4_5-audio-F16.gguf",     "size": 660167904},
+                {"path": "tts/MiniCPM-o-4_5-tts-F16.gguf",         "size": 1157244416},
+                {"path": "tts/MiniCPM-o-4_5-projector-F16.gguf",   "size": 14948640},
+                {"path": "token2wav-gguf/encoder.gguf",             "size": 151339008},
+                {"path": "token2wav-gguf/flow_extra.gguf",          "size": 13663328},
+                {"path": "token2wav-gguf/flow_matching.gguf",       "size": 458250240},
+                {"path": "token2wav-gguf/hifigan2.gguf",            "size": 83242816},
+                {"path": "token2wav-gguf/prompt_cache.gguf",        "size": 211613152},
+                {"path": "vision/MiniCPM-o-4_5-vision-F16.gguf",   "size": 1095113184}
+            ],
+            "optional_files": [
+                {
+                    "path": "vision/coreml_minicpmo45_vit_all_f16.mlmodelc",
+                    "type": "directory",
+                    "platform": "darwin",
+                    "description": "Vision CoreML model for Apple Neural Engine (ANE) acceleration"
+                }
+            ],
+            "components": {
+                "audio":  ["audio/MiniCPM-o-4_5-audio-F16.gguf"],
+                "tts":    ["tts/MiniCPM-o-4_5-tts-F16.gguf", "tts/MiniCPM-o-4_5-projector-F16.gguf"],
+                "vision": ["vision/MiniCPM-o-4_5-vision-F16.gguf"],
+                "vision_ane": ["vision/coreml_minicpmo45_vit_all_f16.mlmodelc"]
+            }
+        }
+    ]
+}

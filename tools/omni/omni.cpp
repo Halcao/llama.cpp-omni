@@ -4003,7 +4003,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     // ANE/CoreML warmup: pre-load models into NPU to avoid first-inference latency
     omni_warmup_ane(ctx_omni);
 
-    print_with_timestamp("=== omni_init success: ctx_llama = %p\n", (void*)ctx_omni->ctx_llama);
+    print_with_timestamp("=== omni_init success [comni]: ctx_llama = %p\n", (void*)ctx_omni->ctx_llama);
     return ctx_omni;
 }
 

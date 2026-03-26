@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Runtime config (user-specific)
+server/config.json
+
+# Runtime data
+server/data/
+server/tmp/
+
+# Build artifacts
+desktop/packaging/dist/
+desktop/packaging/.cache/
+desktop/dist/
+desktop/build/
+
+# Logs
+*.log
+desktop/*.log
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store

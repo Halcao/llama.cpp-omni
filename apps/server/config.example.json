@@ -1,0 +1,26 @@
+{
+    "backend": "cpp",
+
+    "model": {
+        "model_path": "unused-for-cpp-backend"
+    },
+    "audio": {
+        "ref_audio_path": "assets/ref_audio/ref_minicpm_signature.wav",
+        "playback_delay_ms": 200
+    },
+    "service": {
+        "gateway_port": 8006,
+        "worker_base_port": 22700,
+        "max_queue_size": 1000,
+        "request_timeout": 300.0
+    },
+
+    "cpp_backend": {
+        "model_dir": "/path/to/MiniCPM-o-4_5-gguf",
+        "llm_model": "",
+        "cpp_server_port": null,
+        "ctx_size": 8192,
+        "n_gpu_layers": 99,
+        "vision_backend": "auto"
+    }
+}

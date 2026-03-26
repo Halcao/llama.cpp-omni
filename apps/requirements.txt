@@ -1,0 +1,44 @@
+# llama.cpp-omni App Dependencies
+# pip install -r requirements.txt
+
+# Web Service
+fastapi>=0.128.0
+uvicorn>=0.40.0
+httpx>=0.28.0
+websockets>=16.0
+python-multipart
+
+# Data / Schema
+pydantic>=2.11.0
+numpy>=2.2.0
+
+# Audio processing
+soundfile>=0.12.0
+librosa>=0.10.0
+
+# Image processing
+Pillow>=10.0.0
+
+# VAD (Voice Activity Detection)
+onnxruntime>=1.17.0
+
+# Utilities
+tqdm>=4.67.0
+pyyaml>=6.0
+
+# HuggingFace model download & verification
+huggingface_hub>=0.25.0
+requests>=2.31.0
+
+# macOS Desktop App (PyObjC native)
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+
+# Optional: PyTorch backend (not needed for C++ backend)
+# transformers==4.51.0
+# accelerate==1.12.0
+# safetensors>=0.7.0
+# minicpmo-utils[all]>=1.0.5
