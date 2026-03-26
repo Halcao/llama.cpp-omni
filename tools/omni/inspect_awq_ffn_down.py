@@ -40,6 +40,7 @@ class WeightVariant:
     description: str
     qweight_u4: np.ndarray
     qzeros_u4: np.ndarray
+    scales: np.ndarray
     weight_f32: np.ndarray
 
 
@@ -132,6 +133,21 @@ def undo_awq_interleave(values: np.ndarray) -> np.ndarray:
     out = values.copy()
     for base in range(0, values.shape[1], perm.size):
         out[:, base:base + perm.size] = values[:, base + perm]
+    return out
+
+
+def shift_group_axis(values: np.ndarray, offset: int) -> np.ndarray:
+    if offset == 0:
+        return values.copy()
+
+    out = np.empty_like(values)
+    if offset > 0:
+        out[:offset, :] = values[:1, :]
+        out[offset:, :] = values[:-offset, :]
+    else:
+        neg_offset = -offset
+        out[-neg_offset:, :] = values[-1:, :]
+        out[:-neg_offset, :] = values[neg_offset:, :]
     return out
 
 
@@ -308,7 +324,6 @@ def make_weight_variants(
     scales: np.ndarray,
     group_size: int,
 ) -> list[WeightVariant]:
-    repeated_scales = np.repeat(scales, group_size, axis=0)
     qweight_variants = {
         "plain": qweight_u4.astype(np.float32),
         "reverse_pack_order": reverse_pack_factor_order(qweight_u4).astype(np.float32),
@@ -321,37 +336,54 @@ def make_weight_variants(
             reverse_pack_factor_order(qzeros_u4_plain)
         ).astype(np.float32),
     }
+    qparam_group_variants = {
+        "g0": (0, scales.astype(np.float32)),
+        "g-1": (-1, shift_group_axis(scales, -1).astype(np.float32)),
+        "g+1": (1, shift_group_axis(scales, 1).astype(np.float32)),
+    }
     variants: list[WeightVariant] = []
 
     for qweight_name, qweight_variant in qweight_variants.items():
         for qzeros_name, qzeros_u4 in qzeros_variants.items():
-            repeated_qzeros = np.repeat(qzeros_u4, group_size, axis=0)
-            variants.append(
-                WeightVariant(
-                    name=f"{qweight_name}:{qzeros_name}:awq_zp",
-                    description=f"{qweight_name} qweight, {qzeros_name} qzeros, weight=(q-zp)*scale",
-                    qweight_u4=qweight_variant,
-                    qzeros_u4=qzeros_u4,
-                    weight_f32=(qweight_variant - repeated_qzeros) * repeated_scales,
+            for group_name, (group_offset, scales_variant) in qparam_group_variants.items():
+                qzeros_variant = shift_group_axis(qzeros_u4, group_offset).astype(np.float32)
+                repeated_qzeros = np.repeat(qzeros_variant, group_size, axis=0)
+                repeated_scales = np.repeat(scales_variant, group_size, axis=0)
+                variants.append(
+                    WeightVariant(
+                        name=f"{qweight_name}:{qzeros_name}:{group_name}:awq_zp",
+                        description=(
+                            f"{qweight_name} qweight, {qzeros_name} qzeros, "
+                            f"group_offset={group_offset}, weight=(q-zp)*scale"
+                        ),
+                        qweight_u4=qweight_variant,
+                        qzeros_u4=qzeros_variant,
+                        scales=scales_variant,
+                        weight_f32=(qweight_variant - repeated_qzeros) * repeated_scales,
+                    )
                 )
-            )
-            variants.append(
-            WeightVariant(
-                    name=f"{qweight_name}:{qzeros_name}:awq_zp_plus_1",
-                    description=f"{qweight_name} qweight, {qzeros_name} qzeros, weight=(q-(zp+1))*scale",
-                    qweight_u4=qweight_variant,
-                    qzeros_u4=qzeros_u4,
-                    weight_f32=(qweight_variant - (repeated_qzeros + 1.0)) * repeated_scales,
+                variants.append(
+                    WeightVariant(
+                        name=f"{qweight_name}:{qzeros_name}:{group_name}:awq_zp_plus_1",
+                        description=(
+                            f"{qweight_name} qweight, {qzeros_name} qzeros, "
+                            f"group_offset={group_offset}, weight=(q-(zp+1))*scale"
+                        ),
+                        qweight_u4=qweight_variant,
+                        qzeros_u4=qzeros_variant,
+                        scales=scales_variant,
+                        weight_f32=(qweight_variant - (repeated_qzeros + 1.0)) * repeated_scales,
+                    )
                 )
-            )
 
         variants.append(
             WeightVariant(
-                name=f"{qweight_name}:symmetric_u4b8",
-                description=f"{qweight_name} qweight, ignore qzeros, weight=(q-8)*scale",
+                name=f"{qweight_name}:g0:symmetric_u4b8",
+                description=f"{qweight_name} qweight, ignore qzeros, group_offset=0, weight=(q-8)*scale",
                 qweight_u4=qweight_variant,
                 qzeros_u4=qzeros_u4_plain.astype(np.float32),
-                weight_f32=(qweight_variant - 8.0) * repeated_scales,
+                scales=scales.astype(np.float32),
+                weight_f32=(qweight_variant - 8.0) * np.repeat(scales.astype(np.float32), group_size, axis=0),
             )
         )
     return variants
@@ -400,7 +432,6 @@ def print_variant_scoreboard(
 
 def print_contribution_breakdown(
     variant: WeightVariant,
-    scales: np.ndarray,
     down_input: np.ndarray,
     cpu_output: np.ndarray,
     runtime_output: np.ndarray,
@@ -436,14 +467,14 @@ def print_contribution_breakdown(
             f"sum_all={float(np.sum(contrib)):.6f}"
         )
         for kk in order:
-            group = kk // (down_input.shape[0] // scales.shape[0])
+            group = kk // (down_input.shape[0] // variant.scales.shape[0])
             print(
                 f"    k={int(kk):5d} group={int(group):3d} "
                 f"x={float(x_col[kk]):12.6f} "
                 f"w={float(w_col[kk]):12.6f} "
                 f"q={int(q_col[kk]):2d} "
                 f"zp={int(variant.qzeros_u4[group, row]):2d} "
-                f"scale={float(scales[group, row]):10.6f} "
+                f"scale={float(variant.scales[group, row]):10.6f} "
                 f"contrib={float(contrib[kk]):14.6f}"
             )
 
@@ -478,7 +509,7 @@ def main() -> int:
     qzeros_u4_plain = unpack_u4_cols(qzeros_packed, num_groups, size_n)
     weight_variants = make_weight_variants(qweight_u4, qzeros_u4_plain, scales, group_size)
     baseline_variant = next(
-        variant for variant in weight_variants if variant.name == "plain:plain:awq_zp"
+        variant for variant in weight_variants if variant.name == "plain:plain:g0:awq_zp"
     )
     weight_f32 = baseline_variant.weight_f32
 
@@ -584,7 +615,6 @@ def main() -> int:
         for variant, variant_cpu_output, _ in scored[: min(2, len(scored))]:
             print_contribution_breakdown(
                 variant,
-                scales,
                 down_input,
                 variant_cpu_output,
                 runtime_output,
