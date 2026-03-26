@@ -220,6 +220,20 @@ std::vector<uint32_t> marlin_permute_qzeros(
     return pack_u4_rows(marlin_interleaved, rows, size_n);
 }
 
+std::vector<uint32_t> marlin_permute_qzeros_vllm_reference(
+        const std::vector<uint32_t> & qzeros_awq_packed,
+        int rows,
+        int size_n) {
+    // vLLM reference path:
+    // unpack -> undo interleave -> scale perm -> interleave -> repack
+    return marlin_permute_qzeros(
+            qzeros_awq_packed,
+            rows,
+            size_n,
+            true,
+            true);
+}
+
 std::vector<uint32_t> pack_qzeros_source(
         const std::vector<uint32_t> & logical_qzeros,
         int rows,
@@ -285,6 +299,7 @@ struct TestCase {
     bool use_grouped_scale_perm;
     bool qzeros_source_awq_interleaved;
     bool qzeros_output_awq_interleaved;
+    bool use_vllm_reference_qzeros_path;
 };
 
 float allowed_error(const TestCase & tc, float want) {
@@ -406,11 +421,13 @@ void run_test_case(int device, const TestCase & tc) {
                 qzeros_logical[group * tc.n + col] = static_cast<uint32_t>((group * 5 + col * 9 + 2) & 0xF);
             }
         }
-        qzeros_awq_packed = pack_qzeros_source(
-                qzeros_logical,
-                num_groups,
-                tc.n,
-                tc.qzeros_source_awq_interleaved);
+        qzeros_awq_packed = tc.use_vllm_reference_qzeros_path
+                ? pack_qzeros_source(qzeros_logical, num_groups, tc.n, true)
+                : pack_qzeros_source(
+                        qzeros_logical,
+                        num_groups,
+                        tc.n,
+                        tc.qzeros_source_awq_interleaved);
     }
 
     for (int row = 0; row < tc.m; ++row) {
@@ -433,12 +450,17 @@ void run_test_case(int device, const TestCase & tc) {
     const std::vector<__half> packed_scales_host =
             marlin_permute_scales(scales_host, num_groups, tc.n, tc.use_grouped_scale_perm);
     const std::vector<uint32_t> packed_qzeros_host = tc.use_qzeros
-            ? marlin_permute_qzeros(
-                    qzeros_awq_packed,
-                    num_groups,
-                    tc.n,
-                    tc.qzeros_source_awq_interleaved,
-                    tc.qzeros_output_awq_interleaved)
+            ? (tc.use_vllm_reference_qzeros_path
+                    ? marlin_permute_qzeros_vllm_reference(
+                            qzeros_awq_packed,
+                            num_groups,
+                            tc.n)
+                    : marlin_permute_qzeros(
+                            qzeros_awq_packed,
+                            num_groups,
+                            tc.n,
+                            tc.qzeros_source_awq_interleaved,
+                            tc.qzeros_output_awq_interleaved))
             : std::vector<uint32_t>();
 
     DeviceBuffers buffers;
@@ -534,7 +556,8 @@ void run_test_case(int device, const TestCase & tc) {
                            << " zp=" << qzeros_logical[ref_group * tc.n + col]
                            << " q0=" << q_w_host[col]
                            << " qzeros_source_awq_interleaved=" << (tc.qzeros_source_awq_interleaved ? 1 : 0)
-                           << " qzeros_output_awq_interleaved=" << (tc.qzeros_output_awq_interleaved ? 1 : 0);
+                           << " qzeros_output_awq_interleaved=" << (tc.qzeros_output_awq_interleaved ? 1 : 0)
+                           << " use_vllm_reference_qzeros_path=" << (tc.use_vllm_reference_qzeros_path ? 1 : 0);
                 }
                 throw std::runtime_error(
                         detail.str());
@@ -555,7 +578,7 @@ void run_test_case(int device, const TestCase & tc) {
 }
 
 void run_scale_group_alignment_probe(int device) {
-    const TestCase tc{"scale_group_alignment_probe", 15, 4096, 12288, 128, true, true, false, true};
+    const TestCase tc{"scale_group_alignment_probe", 15, 4096, 12288, 128, true, true, false, true, false};
     const int num_groups = tc.k / tc.group_size;
 
     std::vector<__half> a_host(tc.m * tc.k);
@@ -701,26 +724,27 @@ int main() {
     }
 
     std::vector<TestCase> cases = {
-        {"single_group_scales", 16, 64, 128, -1, false, false, false, false},
-        {"grouped_scales", 16, 64, 128, 32, false, true, false, false},
+        {"single_group_scales", 16, 64, 128, -1, false, false, false, false, false},
+        {"grouped_scales", 16, 64, 128, 32, false, true, false, false, false},
     };
 
     bool had_failure = false;
 
     const bool run_qzeros_probe = std::getenv("LLAMA_MARLIN_RUN_QZEROS_PROBE") != nullptr;
     if (run_qzeros_probe) {
-        cases.push_back({"grouped_scales_qzeros_src_awq_out_awq", 16, 64, 128, 32, true, true, true, true});
-        cases.push_back({"grouped_scales_qzeros_src_plain_out_awq", 16, 64, 128, 32, true, true, false, true});
-        cases.push_back({"grouped_scales_qzeros_src_awq_out_plain", 16, 64, 128, 32, true, true, true, false});
-        cases.push_back({"grouped_scales_qzeros_src_plain_out_plain", 16, 64, 128, 32, true, true, false, false});
+        cases.push_back({"grouped_scales_qzeros_vllm_reference", 16, 64, 128, 32, true, true, true, true, true});
+        cases.push_back({"grouped_scales_qzeros_src_awq_out_awq", 16, 64, 128, 32, true, true, true, true, false});
+        cases.push_back({"grouped_scales_qzeros_src_plain_out_awq", 16, 64, 128, 32, true, true, false, true, false});
+        cases.push_back({"grouped_scales_qzeros_src_awq_out_plain", 16, 64, 128, 32, true, true, true, false, false});
+        cases.push_back({"grouped_scales_qzeros_src_plain_out_plain", 16, 64, 128, 32, true, true, false, false, false});
     } else {
         std::cout << "SKIP: grouped_scales_qzeros probe is disabled by default; set LLAMA_MARLIN_RUN_QZEROS_PROBE=1 to run it\n";
     }
 
     const bool run_large_shape_probe = std::getenv("LLAMA_MARLIN_RUN_LARGE_SHAPE_PROBE") != nullptr;
     if (run_large_shape_probe) {
-        cases.push_back({"grouped_scales_large_shape", 15, 4096, 12288, 128, false, true, false, false});
-        cases.push_back({"grouped_scales_qzeros_large_shape_src_plain_out_awq", 15, 4096, 12288, 128, true, true, false, true});
+        cases.push_back({"grouped_scales_large_shape", 15, 4096, 12288, 128, false, true, false, false, false});
+        cases.push_back({"grouped_scales_qzeros_large_shape_src_plain_out_awq", 15, 4096, 12288, 128, true, true, false, true, false});
     } else {
         std::cout << "SKIP: large-shape Marlin probe is disabled by default; set LLAMA_MARLIN_RUN_LARGE_SHAPE_PROBE=1 to run it\n";
     }
