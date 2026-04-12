@@ -134,6 +134,15 @@ GGML_BACKEND_API bool ggml_cuda_marlin_w4a16_gemm(
         int device,
         void * stream);
 
+GGML_BACKEND_API bool ggml_cuda_marlin_gptq_w8_gemm(
+        const struct ggml_tensor * a,
+        const struct ggml_tensor * b_q_weight,
+        const struct ggml_tensor * b_scales,
+        struct ggml_tensor * c,
+        struct ggml_tensor * workspace,
+        int device,
+        void * stream);
+
 #ifdef  __cplusplus
 }
 #endif

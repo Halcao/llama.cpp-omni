@@ -4005,7 +4005,9 @@ class MiniCPMOModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.QWEN3
 
     _awq_linear_suffixes = (".qweight", ".qzeros", ".scales")
+    _gptq_linear_suffixes = (".qweight", ".qzeros", ".scales", ".g_idx")
     _awq_passthrough_prefix = "__mini_cpmo_awq__."
+    _gptq_passthrough_prefix = "__mini_cpmo_gptq__."
 
     def set_vocab(self):
         self._set_vocab_gpt2(trust_remote_code=True)
@@ -4014,11 +4016,35 @@ class MiniCPMOModel(Qwen3Model):
         super().set_gguf_parameters()
 
         quant_cfg = self.hparams.get("quantization_config") or {}
-        if quant_cfg.get("quant_method") == "awq":
-            self.gguf_writer.add_string("qwen3.quantization.method", "awq")
+        quant_method = quant_cfg.get("quant_method")
+        if quant_method in ("awq", "gptq"):
+            def add_quant_bool(key: str) -> None:
+                value = quant_cfg.get(key)
+                if value is not None:
+                    self.gguf_writer.add_bool(f"qwen3.quantization.{key}", bool(value))
+
+            def add_quant_float32(key: str) -> None:
+                value = quant_cfg.get(key)
+                if value is not None:
+                    self.gguf_writer.add_float32(f"qwen3.quantization.{key}", float(value))
+
+            def add_quant_string(key: str) -> None:
+                value = quant_cfg.get(key)
+                if value is not None:
+                    self.gguf_writer.add_string(f"qwen3.quantization.{key}", str(value))
+
+            self.gguf_writer.add_string("qwen3.quantization.method", quant_method)
             self.gguf_writer.add_uint32("qwen3.quantization.bits", int(quant_cfg["bits"]))
             self.gguf_writer.add_uint32("qwen3.quantization.group_size", int(quant_cfg["group_size"]))
-            self.gguf_writer.add_bool("qwen3.quantization.zero_point", bool(quant_cfg.get("zero_point", False)))
+            if quant_method == "awq":
+                add_quant_bool("zero_point")
+            if quant_method == "gptq":
+                add_quant_float32("damp_percent")
+                add_quant_bool("desc_act")
+                add_quant_bool("static_groups")
+                add_quant_bool("sym")
+                add_quant_bool("true_sequential")
+                add_quant_string("checkpoint_format")
 
     @staticmethod
     def _normalize_llm_tensor_name(name: str) -> str | None:
@@ -4050,11 +4076,32 @@ class MiniCPMOModel(Qwen3Model):
             return f"llm.{base_name[:-len('.weight')]}.scales"
         raise ValueError(f"Unsupported AWQ tensor name: {name}")
 
+    def _map_gptq_tensor_name(self, name: str) -> str:
+        if name.endswith(".qweight"):
+            base_name = name[:-len(".qweight")] + ".weight"
+            self.map_tensor_name(base_name)
+            return f"llm.{base_name[:-len('.weight')]}.qweight"
+        if name.endswith(".qzeros"):
+            base_name = name[:-len(".qzeros")] + ".weight"
+            self.map_tensor_name(base_name)
+            return f"llm.{base_name[:-len('.weight')]}.qzeros"
+        if name.endswith(".scales"):
+            base_name = name[:-len(".scales")] + ".weight"
+            self.map_tensor_name(base_name)
+            return f"llm.{base_name[:-len('.weight')]}.scales"
+        if name.endswith(".g_idx"):
+            base_name = name[:-len(".g_idx")] + ".weight"
+            self.map_tensor_name(base_name)
+            return f"llm.{base_name[:-len('.weight')]}.g_idx"
+        raise ValueError(f"Unsupported GPTQ tensor name: {name}")
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         del bid  # unused
 
         if name.startswith(self._awq_passthrough_prefix):
             return [(name.removeprefix(self._awq_passthrough_prefix), data_torch)]
+        if name.startswith(self._gptq_passthrough_prefix):
+            return [(name.removeprefix(self._gptq_passthrough_prefix), data_torch)]
 
         if not name.startswith("llm."):
             # prepare_tensors() runs modify_tensors() twice. On the second pass, names that
@@ -4069,8 +4116,17 @@ class MiniCPMOModel(Qwen3Model):
         if normalized is None:
             return []
 
-        if normalized.endswith(self._awq_linear_suffixes):
+        quant_cfg = self.hparams.get("quantization_config") or {}
+        quant_method = quant_cfg.get("quant_method")
+
+        if quant_method == "awq" and normalized.endswith(self._awq_linear_suffixes):
             return [(self._awq_passthrough_prefix + self._map_awq_tensor_name(normalized), data_torch.T)]
+        if quant_method == "gptq" and normalized.endswith(self._gptq_linear_suffixes):
+            mapped_name = self._map_gptq_tensor_name(normalized)
+            if normalized.endswith((".qweight", ".g_idx")):
+                return [(self._gptq_passthrough_prefix + mapped_name, data_torch)]
+            # Keep GPTQ scales as `*.scales`; the generic writer keeps non-`.weight` tensors in F32.
+            return [(self._gptq_passthrough_prefix + mapped_name, data_torch.T)]
 
         return super().modify_tensors(data_torch, normalized, None)
 

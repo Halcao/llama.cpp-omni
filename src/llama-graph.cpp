@@ -660,6 +660,31 @@ ggml_tensor * llm_graph_context::build_awq_marlin_mm(
     return res;
 }
 
+ggml_tensor * llm_graph_context::build_gptq_marlin_mm(
+         ggml_tensor * cur,
+         ggml_tensor * qweight,
+         ggml_tensor * scales,
+                 int   il) const {
+    GGML_ASSERT(cur != nullptr);
+    GGML_ASSERT(qweight != nullptr);
+    GGML_ASSERT(scales != nullptr);
+    GGML_ASSERT(loras->empty() && "LoRA is not supported on the GPTQ Marlin path yet");
+
+    // The current GPTQ-W8 Marlin path uses F16 activations.
+    if (cur->type != GGML_TYPE_F16) {
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+        cb(cur, "gptq_marlin_input", il);
+    }
+
+    ggml_tensor * workspace = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    cb(workspace, "gptq_marlin_workspace", il);
+
+    ggml_tensor * res = ggml_marlin_gptq_w8(ctx0, cur, qweight, scales, workspace);
+    cb(res, "gptq_marlin_mm", il);
+
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b

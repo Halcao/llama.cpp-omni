@@ -174,3 +174,41 @@ void ggml_cuda_op_marlin_w4a16(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         ggml_cuda_marlin_debug_log_tensor_prefix("output.post", dst, ctx.stream());
     }
 }
+
+void ggml_cuda_op_marlin_gptq_w8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * a             = dst->src[0];
+    const ggml_tensor * qweight       = dst->src[1];
+    const ggml_tensor * scales        = dst->src[2];
+    const ggml_tensor * workspace_src = dst->src[3];
+
+    GGML_ASSERT(a != nullptr);
+    GGML_ASSERT(qweight != nullptr);
+    GGML_ASSERT(scales != nullptr);
+    GGML_ASSERT(workspace_src != nullptr);
+
+    const int workspace_elements = ggml_cuda_marlin_min_workspace_elements(ctx.device);
+    ggml_cuda_pool_alloc<int> workspace_alloc(ctx.pool(), workspace_elements);
+
+    ggml_tensor workspace = *workspace_src;
+    workspace.ne[0] = workspace_elements;
+    workspace.ne[1] = 1;
+    workspace.ne[2] = 1;
+    workspace.ne[3] = 1;
+    workspace.nb[0] = sizeof(int);
+    workspace.nb[1] = workspace.nb[0] * workspace.ne[0];
+    workspace.nb[2] = workspace.nb[1];
+    workspace.nb[3] = workspace.nb[2];
+    workspace.buffer = nullptr;
+    workspace.data = workspace_alloc.get();
+
+    const bool ok = ggml_cuda_marlin_gptq_w8_gemm(
+            a,
+            qweight,
+            scales,
+            dst,
+            &workspace,
+            ctx.device,
+            ctx.stream());
+
+    GGML_ASSERT(ok);
+}

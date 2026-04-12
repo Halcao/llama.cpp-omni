@@ -489,6 +489,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MARLIN_W4A16,
+        GGML_OP_MARLIN_GPTQ_W8,
         GGML_OP_MUL_MAT_ID,
         GGML_OP_OUT_PROD,
 
@@ -1323,6 +1324,13 @@ extern "C" {
             struct ggml_tensor  * qweight,
             struct ggml_tensor  * scales,
             struct ggml_tensor  * qzeros,
+            struct ggml_tensor  * workspace);
+
+    GGML_API struct ggml_tensor * ggml_marlin_gptq_w8(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * qweight,
+            struct ggml_tensor  * scales,
             struct ggml_tensor  * workspace);
 
     // change the precision of a matrix multiplication

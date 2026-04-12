@@ -950,6 +950,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MARLIN_W4A16",
+    "MARLIN_GPTQ_W8",
     "MUL_MAT_ID",
     "OUT_PROD",
 
@@ -1020,7 +1021,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
+static_assert(GGML_OP_COUNT == 92, "GGML_OP_COUNT != 92");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1055,6 +1056,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "marlin_w4a16(x, qweight, scales, qzeros, workspace)",
+    "marlin_gptq_w8(x, qweight, scales, workspace)",
     "X[i]*Y",
     "X*Y",
 
@@ -1125,7 +1127,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 91, "GGML_OP_COUNT != 91");
+static_assert(GGML_OP_COUNT == 92, "GGML_OP_COUNT != 92");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3091,6 +3093,38 @@ struct ggml_tensor * ggml_marlin_w4a16(
     result->src[2] = scales;
     result->src[3] = qzeros;
     result->src[4] = workspace;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_marlin_gptq_w8(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * qweight,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * workspace) {
+    GGML_ASSERT(a != NULL);
+    GGML_ASSERT(qweight != NULL);
+    GGML_ASSERT(scales != NULL);
+    GGML_ASSERT(workspace != NULL);
+
+    GGML_ASSERT(!ggml_is_transposed(a));
+    GGML_ASSERT(qweight->type == GGML_TYPE_I32);
+    GGML_ASSERT(workspace->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->type == GGML_TYPE_F16);
+    GGML_ASSERT(scales->type == GGML_TYPE_F16);
+
+    GGML_ASSERT(a->ne[0] == qweight->ne[0]);
+    GGML_ASSERT(qweight->ne[1] * 4 == scales->ne[1]);
+
+    const int64_t ne[4] = { scales->ne[1], a->ne[1], a->ne[2], a->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, 4, ne);
+
+    result->op     = GGML_OP_MARLIN_GPTQ_W8;
+    result->src[0] = a;
+    result->src[1] = qweight;
+    result->src[2] = scales;
+    result->src[3] = workspace;
 
     return result;
 }

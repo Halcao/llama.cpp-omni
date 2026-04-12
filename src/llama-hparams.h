@@ -68,6 +68,13 @@ struct llama_hparams {
     llama_quantization_method quant_method = LLAMA_QUANTIZATION_METHOD_NONE;
     uint32_t quant_bits           = 0;
     uint32_t quant_group_size     = 0;
+    float quant_damp_percent      = 0.0f;
+    bool quant_zero_point         = false;
+    bool quant_desc_act           = false;
+    bool quant_static_groups      = false;
+    bool quant_sym                = false;
+    bool quant_true_sequential    = false;
+    std::array<char, 32> quant_checkpoint_format = {};
 
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
@@ -144,8 +151,6 @@ struct llama_hparams {
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
 
     bool ssm_dt_b_c_rms = false;
-    bool quant_zero_point = false;
-
     float f_clamp_kqv      = 0.0f;
     float f_max_alibi_bias = 0.0f;
     float f_logit_scale    = 0.0f;

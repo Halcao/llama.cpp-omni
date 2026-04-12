@@ -688,3 +688,87 @@ extern "C" bool ggml_cuda_marlin_w4a16_gemm(
 
     return ggml_cuda_marlin_gemm(&params);
 }
+
+extern "C" bool ggml_cuda_marlin_gptq_w8_gemm(
+        const ggml_tensor * a,
+        const ggml_tensor * b_q_weight,
+        const ggml_tensor * b_scales,
+        ggml_tensor * c,
+        ggml_tensor * workspace,
+        int device,
+        void * stream) {
+    GGML_ASSERT(a != nullptr);
+    GGML_ASSERT(b_q_weight != nullptr);
+    GGML_ASSERT(b_scales != nullptr);
+    GGML_ASSERT(c != nullptr);
+    GGML_ASSERT(workspace != nullptr);
+
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(b_q_weight));
+    GGML_ASSERT(ggml_is_contiguous(b_scales));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(ggml_is_contiguous(workspace));
+
+    const int64_t size_k = a->ne[0];
+    const int64_t size_m = ggml_nelements(a) / size_k;
+    const int64_t size_n = b_scales->ne[1];
+    const int64_t num_groups = b_scales->ne[0];
+    const int64_t group_size = num_groups > 1 ? size_k / num_groups : -1;
+    const int64_t lda = a->nb[1] / ggml_type_size(a->type);
+    int marlin_device = device;
+
+    if (marlin_device < 0) {
+        CUDA_CHECK(cudaGetDevice(&marlin_device));
+    }
+
+    GGML_ASSERT(size_k > 0);
+    GGML_ASSERT(size_m > 0);
+    GGML_ASSERT(size_n > 0);
+    GGML_ASSERT(num_groups > 0);
+    GGML_ASSERT(group_size == 128);
+    GGML_ASSERT(b_q_weight->ne[0] == size_k);
+    GGML_ASSERT(b_q_weight->ne[1] * 4 == size_n);
+    GGML_ASSERT(c->ne[0] == size_n);
+    GGML_ASSERT(ggml_nelements(c) / c->ne[0] == size_m);
+    GGML_ASSERT(workspace->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(workspace) >= ggml_cuda_marlin_min_workspace_elements(marlin_device));
+
+    ggml_cuda_marlin_gemm_params params = {};
+    params.a = a->data;
+    params.b_q_weight = b_q_weight->data;
+    params.c = c->data;
+    params.c_tmp = nullptr;
+    params.b_bias = nullptr;
+    params.a_scales = nullptr;
+    params.b_scales = b_scales->data;
+    params.global_scale = nullptr;
+    params.b_zeros = nullptr;
+    params.g_idx = nullptr;
+    params.perm = nullptr;
+    params.a_tmp = nullptr;
+    params.workspace = static_cast<int *>(workspace->data);
+    params.size_m = size_m;
+    params.size_n = size_n;
+    params.size_k = size_k;
+    params.lda = lda;
+    params.num_groups = num_groups;
+    params.group_size = group_size;
+    params.device = marlin_device;
+    params.stream = stream;
+    params.sms = 0;
+    params.thread_k = -1;
+    params.thread_n = -1;
+    params.a_type = ggml_cuda_marlin_type_from_ggml(a->type);
+    params.b_type = GGML_CUDA_MARLIN_TYPE_U8B128;
+    params.c_type = ggml_cuda_marlin_type_from_ggml(c->type);
+    params.s_type = ggml_cuda_marlin_type_from_ggml(b_scales->type);
+    params.has_bias = false;
+    params.has_act_order = false;
+    params.is_k_full = true;
+    params.has_zp = false;
+    params.use_atomic_add = false;
+    params.use_fp32_reduce = false;
+    params.is_zp_float = false;
+
+    return ggml_cuda_marlin_gemm(&params);
+}

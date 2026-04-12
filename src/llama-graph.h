@@ -611,6 +611,12 @@ struct llm_graph_context {
              ggml_tensor * scales,
                      int   il) const;
 
+    ggml_tensor * build_gptq_marlin_mm(
+             ggml_tensor * cur,
+             ggml_tensor * qweight,
+             ggml_tensor * scales,
+                     int   il) const;
+
     // do mat_mul_id, while optionally apply lora
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
