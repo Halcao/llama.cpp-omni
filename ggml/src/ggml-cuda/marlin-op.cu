@@ -158,6 +158,14 @@ void ggml_cuda_op_marlin_w4a16(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     workspace.buffer = nullptr;
     workspace.data = workspace_alloc.get();
 
+    // vLLM Marlin kernels use `workspace` as a per-tile lock buffer for
+    // barrier_acquire/barrier_release when slicing across SMs (m > 1 prefill
+    // path). The kernels assume every lock is initialized to 0; with CUDA
+    // pool reuse that invariant is broken and the kernel deadlocks. Zero the
+    // workspace on `stream` so the clear is ordered before the gemm launch.
+    CUDA_CHECK(cudaMemsetAsync(workspace.data, 0,
+                               workspace_elements * sizeof(int), ctx.stream()));
+
     const bool ok = ggml_cuda_marlin_w4a16_gemm(
             a,
             qweight,
@@ -200,6 +208,12 @@ void ggml_cuda_op_marlin_gptq_w8(ggml_backend_cuda_context & ctx, ggml_tensor * 
     workspace.nb[3] = workspace.nb[2];
     workspace.buffer = nullptr;
     workspace.data = workspace_alloc.get();
+
+    // See ggml_cuda_op_marlin_w4a16 for the rationale: Marlin locks must be 0
+    // before each launch, otherwise the cross-SM barrier spins forever on the
+    // prefill path.
+    CUDA_CHECK(cudaMemsetAsync(workspace.data, 0,
+                               workspace_elements * sizeof(int), ctx.stream()));
 
     const bool ok = ggml_cuda_marlin_gptq_w8_gemm(
             a,
