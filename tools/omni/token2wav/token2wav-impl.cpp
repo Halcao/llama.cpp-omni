@@ -7793,6 +7793,86 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
     }
     return true;
 }
+// Pre-warm gf_nonlast's CUDA graph instance under the session's real shapes, using
+// dummy text tokens. The 4 persistent conformer/estimator cache tensors are
+// snapshotted before the compute and restored afterwards, so the first real
+// inference_chunk sees bit-exactly the same cache state as if prewarm were never
+// called — only the ggml-cuda CUDA graph instance cache is warm.
+bool flowGGUFModelRunner::prewarm_nonlast() {
+    if (const char * e = std::getenv("OMNI_T2W_DISABLE_PREWARM"); e && std::string(e) != "0") {
+        return true;
+    }
+    if (!sess_ || !sess_->ctx || !sess_->gf_nonlast) {
+        return false;
+    }
+    if (!loader_.backend() || !loader_.model()) {
+        return false;
+    }
+    // CPU backends have no CUDA graph to warm; skip and return success.
+    if (!runner_backend_is_device(loader_.backend())) {
+        return true;
+    }
+    omni::flow::profile::ScopeTimer _t("t2m.prewarm");
+
+    // Snapshot the 4 persistent cache tensors before running the dummy graph.
+    // These are the ones gf_nonlast writes back to via cpy_* ops; warmup would
+    // otherwise leave dummy-token-derived values in them, corrupting the first
+    // real chunk's decoder context.
+    std::vector<uint8_t> snap_conf_cnn, snap_conf_att, snap_est_cnn, snap_est_att;
+    if (sess_->conf_cnn_cache) runner_read_tensor_bytes(loader_.backend(), sess_->conf_cnn_cache, snap_conf_cnn);
+    if (sess_->conf_att_cache) runner_read_tensor_bytes(loader_.backend(), sess_->conf_att_cache, snap_conf_att);
+    if (sess_->est_cnn_cache)  runner_read_tensor_bytes(loader_.backend(), sess_->est_cnn_cache,  snap_est_cnn);
+    if (sess_->est_att_cache)  runner_read_tensor_bytes(loader_.backend(), sess_->est_att_cache,  snap_est_att);
+
+    // Upload dummy chunk tokens (all zeros) into the session's chunk_token_ids_tb.
+    // Shape matches exactly what real inference uses, so the CUDA graph instance
+    // captured here stays valid for subsequent real calls (buffer addresses are
+    // session-persistent).
+    const int64_t T_chunk = sess_->T_chunk_token;
+    const int64_t B       = sess_->B;
+    std::vector<int32_t> dummy_tokens((size_t) B * (size_t) T_chunk, 0);
+    backend_tensor_set(loader_.backend(), sess_->chunk_token_ids_tb, dummy_tokens.data(),
+                       dummy_tokens.size() * sizeof(int32_t));
+    runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
+
+    // Feed the same noise/timestep scaffold as a real nonlast inference_chunk.
+    const int     call_id      = sess_->call_id_nonlast;
+    const int64_t last_att_len = sess_->est_att_cache ? sess_->est_att_cache->ne[1] : 0;
+    ggml_tensor * feat         = sess_->out_feat_nonlast_ctb;
+    if (!feat) {
+        return false;
+    }
+    const int64_t C = feat->ne[0];
+    const int64_t T = feat->ne[1];
+    runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, sess_->n_timesteps, sess_->temperature,
+                             last_att_len, C, T, B);
+
+    // Actual compute: this triggers the ggml-cuda graph capture path on the very
+    // first call, which is the ~64ms cost we want to overlap with LLM prefill.
+    const ggml_status st = ggml_backend_graph_compute(loader_.backend(), sess_->gf_nonlast);
+    if (st != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("flowGGUFModelRunner.prewarm_nonlast: compute failed, st=%d\n", (int) st);
+        // Still try to restore caches below — we don't want to leave them dirty.
+    }
+    ggml_backend_synchronize(loader_.backend());
+
+    // Restore the 4 persistent cache tensors. Order doesn't matter; restores are
+    // independent tensor writes.
+    if (sess_->conf_cnn_cache && !snap_conf_cnn.empty()) {
+        ggml_backend_tensor_set(sess_->conf_cnn_cache, snap_conf_cnn.data(), 0, snap_conf_cnn.size());
+    }
+    if (sess_->conf_att_cache && !snap_conf_att.empty()) {
+        ggml_backend_tensor_set(sess_->conf_att_cache, snap_conf_att.data(), 0, snap_conf_att.size());
+    }
+    if (sess_->est_cnn_cache && !snap_est_cnn.empty()) {
+        ggml_backend_tensor_set(sess_->est_cnn_cache, snap_est_cnn.data(), 0, snap_est_cnn.size());
+    }
+    if (sess_->est_att_cache && !snap_est_att.empty()) {
+        ggml_backend_tensor_set(sess_->est_att_cache, snap_est_att.data(), 0, snap_est_att.size());
+    }
+
+    return st == GGML_STATUS_SUCCESS;
+}
 bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cache_host,
                                                 const float *               spk_bc,
                                                 int64_t                     B,
@@ -8321,6 +8401,13 @@ bool Token2Mel::start_stream_with_prompt(const PromptBundle & prompt, int n_time
     cache_in_       = cache0;
     stream_started_ = true;
 
+    // Pre-warm gf_nonlast's CUDA graph instance under the session's real shapes.
+    // The first real push_tokens() otherwise eats ~60ms of CUDA graph capture; doing
+    // it here moves that cost earlier in time where it can overlap with LLM prefill.
+    // Cache tensors are snapshot+restored internally, so this is observationally
+    // a no-op on the session state. CPU backends skip automatically.
+    (void) runner_.prewarm_nonlast();
+
     // 自动导出 prompt_cache.gguf (如果 cache 有效且同目录没有新版 GGUF)
     // 这样下次启动可以直接用 init_from_host_caches 加载，省去 setup_cache 实时计算
     if (!cache0.empty()) {
@@ -8423,6 +8510,12 @@ bool Token2Mel::start_stream_with_prompt_cache_gguf(const std::string & prompt_c
     spk_bc_      = std::move(spk_bc);
     cache_in_.clear();
     stream_started_ = true;
+
+    // Same rationale as start_stream_with_prompt: pre-warm gf_nonlast's CUDA graph
+    // before the first real push_tokens() call, so the ~60ms capture cost happens
+    // here (overlappable with LLM prefill) rather than in the first chunk.
+    (void) runner_.prewarm_nonlast();
+
     return true;
 }
 

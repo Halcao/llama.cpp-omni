@@ -1646,6 +1646,16 @@ class flowGGUFModelRunner {
                                int64_t                     B,
                                int                         n_timesteps,
                                float                       temperature);
+    // Run one dry `inference_chunk(last=false)` on the current stream session using
+    // dummy text tokens, so that the CUDA graph for gf_nonlast is captured and the
+    // ggml-cuda instance cache is hot by the time the first real text tokens arrive.
+    // The 4 persistent cache tensors (conformer_{cnn,att}, estimator_{cnn,att}) are
+    // snapshotted before the compute and restored afterwards, so callers observe no
+    // state change — only the CUDA graph instance is left cached.
+    // Returns false if no session is set up yet (must be called after start_stream_* /
+    // setup_cache succeeded). No-op when backend is CPU (no CUDA graph machinery to warm).
+    // Opt-out via env OMNI_T2W_DISABLE_PREWARM=1.
+    bool prewarm_nonlast();
   private:
     struct streamSession;
     int  num_threads_           = 1;
@@ -1987,6 +1997,16 @@ class Token2Mel {
     bool push_tokens(const std::vector<int32_t> & tokens, bool is_final, std::vector<float> & mel_bct_out) {
         return push_tokens(tokens.data(), (int64_t) tokens.size(), is_final, mel_bct_out);
     }
+
+    // Warm up the CUDA graph instance cache for the nonlast inference graph on the
+    // currently active stream, using dummy tokens. Safe to call after a successful
+    // start_stream_* — it runs one dry compute on gf_nonlast with the 4 persistent
+    // cache tensors snapshot-and-restored around it, so the subsequent first real
+    // push_tokens() sees bit-exactly the same state as without warmup, minus the
+    // ~60ms CUDA graph capture cost (which has now been moved earlier in time and
+    // can overlap with LLM prefill).
+    // No-op on CPU backends. Opt-out via env OMNI_T2W_DISABLE_PREWARM=1.
+    bool prewarm_nonlast() { return runner_.prewarm_nonlast(); }
 
     void reset_stream();
 
