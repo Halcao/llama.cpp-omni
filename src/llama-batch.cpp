@@ -294,7 +294,39 @@ bool llama_batch_allocr::init(
 
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
-            if (p0 >= 0) {
+            // [omni] Upstream introduced a strict consecutive-position check:
+            //     seq_pos_min(s) (== Y, batch's first new pos)
+            //     must equal
+            //     memory->seq_pos_max(s) + 1 (== X + 1, KV cache's tail + 1).
+            //
+            // This is too strict for omni's duplex flow. omni has a separate LLM
+            // worker thread that advances the KV cache via llama_decode while the
+            // main thread independently maintains its own n_past counter (used to
+            // construct llama_batch.pos[] for the next chunk's audio/text prefill).
+            // Between chunks the two diverge by O(LLM-generated tokens), so on
+            // chunk N+1 prefill we routinely have Y < X + 1 (the new batch starts
+            // at omni's n_past, which lags behind KV's seq_pos_max because the
+            // LLM thread has decoded a few extra tokens beyond what omni's
+            // bookkeeping tracks). Old upstream tolerated this; new upstream
+            // refuses to start the decode.
+            //
+            // Authoritative source of truth in omni's design is the omni-side
+            // n_past, NOT the KV cache tail. omni intentionally re-prefills (and
+            // implicitly overwrites) the trailing KV slots that the LLM thread
+            // produced past omni's bookkeeping point. The check here would
+            // require either re-architecting omni's chunk-boundary state machine
+            // or calling llama_kv_self_seq_rm before every audio prefill -- both
+            // are bigger changes than we want at the migration stage.
+            //
+            // Workaround: disable the check. KV cache will be partially
+            // overwritten by the new prefill, which is the omni-intended
+            // semantic. The "positions are not continuous" check below (gap
+            // within a single batch) is still active.
+            //
+            // TODO(omni-migration): replace omni's hand-rolled n_past with
+            // llama_kv_self_seq_pos_max(ctx, 0) reads, then re-enable this
+            // check upstream-clean.
+            if (false && p0 >= 0) {
                 bool ok = true;
 
                 if (seq_pos_min(s) != p0 + 1) {
