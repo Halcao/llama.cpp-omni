@@ -25,6 +25,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #if defined(GGML_USE_HIP)
@@ -944,36 +945,6 @@ struct ggml_cuda_graph {
     bool disable_due_to_failed_graph_capture = false;
     int number_consecutive_updates = 0;
 
-    // Per-backend-instance opt-in: skip the "ADD with src[1]->ne[1]>1 disables CUDA graph"
-    // guard. Only safe when the caller guarantees that every graph invocation on this
-    // backend has identical shapes (e.g. token2wav's fixed-shape CFM / vocoder graphs).
-    // Enable via the extension API `ggml_backend_cuda_set_allow_batched_add`, reached
-    // through `ggml_backend_reg_get_proc_address("ggml_backend_cuda_set_allow_batched_add")`.
-    bool allow_batched_add = false;
-
-    // Per-backend-instance opt-out: when true, the next ggml_backend_graph_compute call
-    // on this backend bypasses the CUDA graph capture/update machinery ENTIRELY — i.e.
-    // `use_cuda_graph` is forced false from the very top, BEFORE `is_cuda_graph_update_required`
-    // runs, so the cached `ggml_graph_properties` and `instance` are NOT touched.
-    //
-    // Motivation: some callers (e.g. token2wav) alternate between two structurally
-    // different graphs (gf_nonlast vs gf_last). If the "odd one out" graph (gf_last)
-    // is allowed through the normal path, `is_cuda_graph_update_required` overwrites
-    // the properties cache with gf_last's shape — which then forces the NEXT gf_nonlast
-    // invocation to be update_required=true and re-instantiate its CUDA graph, erasing
-    // the hot-path savings. Setting `disable_graph=true` around the gf_last compute
-    // keeps the gf_nonlast instance hot across the whole stream.
-    //
-    // Typical use at the call site:
-    //   auto fn = (void(*)(ggml_backend_t, bool))
-    //       ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_disable_graph");
-    //   if (fn) fn(backend, true);
-    //   ggml_backend_graph_compute(backend, gf_last);
-    //   if (fn) fn(backend, false);
-    //
-    // No-op when ggml-cuda was built without USE_CUDA_GRAPH.
-    bool disable_graph = false;
-
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
     bool use_cpy_indirection = false;
     std::vector<char *> cpy_dest_ptrs;
@@ -993,7 +964,58 @@ struct ggml_backend_cuda_context {
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
-    std::unique_ptr<ggml_cuda_graph> cuda_graph;
+#ifdef USE_CUDA_GRAPH
+    // Multi-slot CUDA graph cache. Key = `cgraph->nodes[0]` pointer (stable because
+    // cgraphs are built once into long-lived ggml_contexts in typical callers, e.g.
+    // token2wav's streamSession). Allows a single backend context to cache multiple
+    // structurally different graphs concurrently (e.g. token2wav gf_nonlast vs gf_last)
+    // instead of the two evicting each other under the old single-slot model.
+    //
+    // Fallback correctness: if a key is reused for a structurally different graph
+    // (e.g. ggml_context buffer recycled across sessions), the per-node property
+    // full-diff inside is_cuda_graph_update_required() detects the mismatch and
+    // triggers a clean re-capture + re-instantiate — same cost as a single-slot miss.
+    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+
+    // Raw pointer to the "currently active" slot, set at the top of
+    // ggml_backend_cuda_graph_compute before any downstream code runs. Lets all
+    // existing `cuda_ctx->cuda_graph->...` / `ctx.cuda_graph->...` call sites keep
+    // working without threading a parameter through 5+ functions and cpy/mean ops.
+    ggml_cuda_graph * cuda_graph = nullptr;
+
+    // Per-backend-instance opt-in: skip the "ADD with src[1]->ne[1]>1 disables CUDA graph"
+    // guard. Only safe when the caller guarantees that every graph invocation on this
+    // backend has identical shapes (e.g. token2wav's fixed-shape CFM / vocoder graphs).
+    // Enable via the extension API `ggml_backend_cuda_set_allow_batched_add`, reached
+    // through `ggml_backend_reg_get_proc_address("ggml_backend_cuda_set_allow_batched_add")`.
+    //
+    // Lives on the context (not per-graph) because the setter is invoked once at
+    // backend init — before any graph is known — and applies uniformly to every
+    // graph that runs on this backend.
+    bool allow_batched_add = false;
+
+    // Per-backend-instance opt-out: when true, the next ggml_backend_graph_compute call
+    // on this backend bypasses the CUDA graph capture/update machinery ENTIRELY.
+    //
+    // Historically used by token2wav to keep a rarely-used graph (gf_last) from evicting
+    // a hot graph (gf_nonlast) in the single-slot CUDA graph cache. With the multi-slot
+    // cache above, each graph owns its own slot so this escape hatch is no longer needed
+    // for that pattern. The setter is kept for backwards compatibility with existing
+    // callers; new callers should prefer relying on the multi-slot cache.
+    bool disable_graph = false;
+
+    // Look up (or create) the slot for a given graph key. Returns a raw pointer to
+    // the owned ggml_cuda_graph inside the map. Called once at the top of
+    // ggml_backend_cuda_graph_compute; the returned pointer is then cached in
+    // `this->cuda_graph` for downstream code to consume.
+    ggml_cuda_graph * cuda_graph_for_key(const void * first_node_ptr) {
+        auto it = cuda_graphs.find(first_node_ptr);
+        if (it == cuda_graphs.end()) {
+            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+        }
+        return it->second.get();
+    }
+#endif // USE_CUDA_GRAPH
 
     explicit ggml_backend_cuda_context(int device) :
         device(device),

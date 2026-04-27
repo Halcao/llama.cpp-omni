@@ -352,6 +352,10 @@ int main(int argc, char ** argv) {
     params.tts_model = paths.tts;
     params.n_ctx = n_ctx;
     params.n_gpu_layers = n_gpu_layers;
+    if (const char * seed_env = std::getenv("OMNI_DUPLEX_SEED")) {
+        params.sampling.seed = (uint32_t) std::atoi(seed_env);
+        printf("  Sampling seed: %u (from OMNI_DUPLEX_SEED, deterministic)\n", params.sampling.seed);
+    }
 
     std::string tts_bin_dir = get_parent_dir(paths.tts);
 
@@ -367,8 +371,11 @@ int main(int argc, char ** argv) {
     printf("  Mode: DUPLEX\n");
 
     // 关键: duplex_mode=true
+    const char * t2w_dev_env = std::getenv("OMNI_T2W_DEVICE");
+    std::string t2w_dev = t2w_dev_env ? t2w_dev_env : "cpu";
+    printf("  Token2Wav device: %s%s\n", t2w_dev.c_str(), t2w_dev_env ? " (from OMNI_T2W_DEVICE)" : " (default)");
     auto ctx_omni = omni_init(&params, media_type, use_tts, tts_bin_dir,
-                              /*tts_gpu_layers=*/-1, /*token2wav_device=*/"cpu",
+                              /*tts_gpu_layers=*/-1, /*token2wav_device=*/t2w_dev,
                               /*duplex_mode=*/true,
                               /*existing_model=*/nullptr, /*existing_ctx=*/nullptr,
                               /*base_output_dir=*/output_dir);
