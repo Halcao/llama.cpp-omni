@@ -3203,6 +3203,42 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             }
                         }
                     }
+
+                    // [omni] MiniCPM-o TTS sub-model carries 11 non-LLaMA tensors that the
+                    // standard LLaMA arch loader does not know about (emb_code, emb_text,
+                    // projector_semantic.{linear1,linear2}.{weight,bias},
+                    // projector_spk.{linear1,linear2}.{weight,bias}, head_code).
+                    // These are loaded separately in omni_init via load_tts_weights_from_gguf
+                    // (tools/omni/omni.cpp). Without this block, llama_model_loader::done_getting_tensors
+                    // would fail with "wrong number of tensors; expected 193, got 182" because the
+                    // .gguf header counts them but the standard loader never created them.
+                    // Mark them as consumed (n_created++) and remove their bytes from size_data
+                    // so the count check passes and the standard loader does not double-allocate.
+                    {
+                        const char * tts_tensor_names[] = {
+                            "emb_code.0.weight",
+                            "emb_text.weight",
+                            "projector_semantic.linear1.weight",
+                            "projector_semantic.linear1.bias",
+                            "projector_semantic.linear2.weight",
+                            "projector_semantic.linear2.bias",
+                            "projector_spk.linear1.weight",
+                            "projector_spk.linear1.bias",
+                            "projector_spk.linear2.weight",
+                            "projector_spk.linear2.bias",
+                            "head_code.0.weight",
+                        };
+                        for (const char * tts_name : tts_tensor_names) {
+                            struct ggml_tensor * tts_tensor = ml.get_tensor_meta(tts_name);
+                            if (tts_tensor) {
+                                const size_t nbytes = ggml_nbytes(tts_tensor);
+                                LLAMA_LOG_INFO("%s: skipping TTS tensor %s (size = %zu bytes) -- will be loaded separately by omni\n",
+                                               __func__, tts_name, nbytes);
+                                ml.size_data -= nbytes;
+                                ml.n_created++;
+                            }
+                        }
+                    }
                 } break;
             case LLM_ARCH_LLADA:
                 {
