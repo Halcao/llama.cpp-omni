@@ -4307,6 +4307,30 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
             //   1. 新会话开始（通过 reset API）
             //   2. 滑动窗口触发（context 满了）
             print_with_timestamp("LLM thread: prefill continuing, n_past=%d (no KV cache clear)\n", ctx_omni->n_past);
+
+            // [omni-migration] Defensive truncate: drop any KV positions past
+            // omni's tracked n_past for sequence 0 before the prefill batch is
+            // built. Required because:
+            //   1. omni runs the LLM decode loop on a separate worker thread.
+            //      Between chunk N's decode finishing and chunk N+1's prefill
+            //      starting, the decoder thread can race past the chunk
+            //      boundary and write a few extra reply-tail tokens into KV
+            //      that omni's main-thread n_past doesn't track.
+            //   2. Upstream's batch validator (src/llama-batch.cpp) now
+            //      enforces seq_pos_min(s) == seq_pos_max(s) + 1 (no overlap,
+            //      no rewind), so even a single extra KV token causes the
+            //      next decode to fail with "Y = X + 1" inconsistency error.
+            //   3. Semantically this rm is the correct omni behavior: the
+            //      assistant's 1Hz reply tail is NOT part of accumulated
+            //      conversation context (duplex 1Hz chunking), it should be
+            //      discarded before the next user audio prefill anyway.
+            // Cost: ~free (KV metadata-only update, no data movement).
+            {
+                llama_memory_t mem_prefill = llama_get_memory(ctx_omni->ctx_llama);
+                if (mem_prefill) {
+                    llama_memory_seq_rm(mem_prefill, 0, ctx_omni->n_past, -1);
+                }
+            }
             
             // 标记前缀填充未完成，防止解码线程过早开始
             prefill_done = false;
