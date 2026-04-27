@@ -548,6 +548,14 @@ struct common_params {
     int image_min_tokens = -1;
     int image_max_tokens = -1;
 
+    // omni model (see tools/omni)
+    std::string tts_model            = ""; // model path
+    std::string apm_model            = ""; // model path
+    std::string vpm_model            = ""; // model path
+
+    // Apple Neural Engine (CoreML) support for omni vision
+    std::string vision_coreml_model_path = ""; // path to CoreML .mlmodelc for vision ANE
+
     // finetune
     struct lr_opt lr;
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
