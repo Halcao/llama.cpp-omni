@@ -4472,19 +4472,36 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
         // 1. 所有嵌入数据都已处理完成（队列为空）
         // 2. 解码线程设置了 need_speek = true，表示需要开始生成文本
 
+        // [omni-graph-race-fix] Re-acquire llm_thread_info->mtx before reading
+        // queue.empty()/need_speek and writing prefill_done/need_speek/speek_done.
+        // In the prefill-just-finished path, `lock` was released at line 4348
+        // before the prefill batch was built, so the writes at the end of
+        // branch-2 would otherwise be unsynchronized w.r.t. the main thread's
+        // g_decode_cv.wait predicate in stream_decode. A stale prefill_done=true
+        // observed by main on the next chunk causes main to skip cv.wait and
+        // race ahead of this thread — which then has cudaStreamBeginCapture
+        // active on the same CUDA stream that main is about to call
+        // cudaStreamSynchronize on, hard-erroring with "operation not permitted
+        // when stream is capturing".
+        // (In the queue-was-empty path, the outer `lock` is still held from
+        // the cv.wait at the top of the loop, so owns_lock() is true here.)
+        if (!lock.owns_lock()) {
+            lock.lock();
+        }
         if (queue.empty() && ctx_omni->need_speek){
             // 标记前缀填充完成
             prefill_done = true;
-            
+
             // 如果使用TTS，重置speek_done标志，允许TTS线程开始工作
             if (ctx_omni->use_tts && !ctx_omni->duplex_mode) {
                 ctx_omni->speek_done = false;
             }
-            
+
             // 重置need_speek标志
             ctx_omni->need_speek = false;
-            
-            // 通知等待的解码线程：前缀填充已完成，可以开始生成文本了
+
+            // 释放锁后再通知，避免 waiter 被唤醒后立即在已持有的 mutex 上再次阻塞
+            lock.unlock();
             g_decode_cv.notify_all();
         }
     }
@@ -9095,13 +9112,25 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             print_with_timestamp("stream_decode: create t2w thread\n");
         }
         
-        ctx_omni->need_speek = true;
-        //ctx_omni->llm_thread.join();
-        ctx_omni->llm_thread_info->cv.notify_all();
         print_with_timestamp("wait prefill done\n");
-        std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
-        g_decode_cv.wait(lock, []{ return prefill_done; });
-        prefill_done = false;
+        // [omni-graph-race-fix] All sequencing state (prefill_done, need_speek)
+        // must be set/read under the LLM-thread mutex so the LLM worker's
+        // writes in branch-2 of llm_thread_func don't race with main's
+        // predicate check below. Without resetting prefill_done=false here,
+        // a stale "true" left over from the previous chunk's branch-2 notify
+        // can cause main to skip cv.wait entirely and race ahead of the LLM
+        // worker — which then has cudaStreamBeginCapture active on the same
+        // CUDA stream that main is about to call cudaStreamSynchronize on,
+        // hard-erroring with "operation not permitted when stream is
+        // capturing".
+        {
+            std::unique_lock<std::mutex> lock(ctx_omni->llm_thread_info->mtx);
+            prefill_done = false;
+            ctx_omni->need_speek = true;
+            ctx_omni->llm_thread_info->cv.notify_all();
+            g_decode_cv.wait(lock, []{ return prefill_done; });
+            prefill_done = false;
+        }
     }
     // 只有启用 TTS 时才设置 speek_done 为 false
     if (ctx_omni->use_tts) {
