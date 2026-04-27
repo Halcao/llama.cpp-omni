@@ -2643,7 +2643,7 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
     // cutting per-op launch overhead to a single cudaGraphLaunch. The flag is scoped
     // to this ggml_backend_cuda_context so other modules that share the same process
     // (e.g. llama.cpp decoder on another backend) remain unaffected.
-    const bool allow_batched_add_in_cuda_graph = cuda_ctx->cuda_graph->allow_batched_add;
+    const bool allow_batched_add_in_cuda_graph = cuda_ctx->allow_batched_add;
 
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
     cuda_ctx->cuda_graph->cpy_dest_ptrs.clear();
@@ -2722,7 +2722,7 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_backend_cud
     if (use_cuda_graph) {
         cuda_ctx->cuda_graph->use_cpy_indirection = true;
         // copy pointers to GPU so they can be accessed via indirection within CUDA graph
-        ggml_cuda_cpy_dest_ptrs_copy(cuda_ctx->cuda_graph.get(), cuda_ctx->cuda_graph->cpy_dest_ptrs.data(), cuda_ctx->cuda_graph->cpy_dest_ptrs.size(), cuda_ctx->stream());
+        ggml_cuda_cpy_dest_ptrs_copy(cuda_ctx->cuda_graph, cuda_ctx->cuda_graph->cpy_dest_ptrs.data(), cuda_ctx->cuda_graph->cpy_dest_ptrs.size(), cuda_ctx->stream());
     }
 
     return use_cuda_graph;
@@ -3100,10 +3100,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #ifdef USE_CUDA_GRAPH
     static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
 
-    // Objects required for CUDA Graph
-    if (cuda_ctx->cuda_graph == nullptr) {
-        cuda_ctx->cuda_graph.reset(new ggml_cuda_graph());
-    }
+    // Select the per-cgraph slot in the multi-slot cache. Key = cgraph->nodes[0]
+    // pointer, which is stable across invocations when the caller builds a cgraph
+    // once into a long-lived ggml_context (the common case). Empty cgraphs map to
+    // a single fallback slot under the nullptr key — behavior stays safe.
+    const void * graph_key = (cgraph && cgraph->n_nodes > 0) ? (const void *) cgraph->nodes[0] : nullptr;
+    cuda_ctx->cuda_graph = cuda_ctx->cuda_graph_for_key(graph_key);
 
     bool use_cuda_graph = true;
     bool cuda_graph_update_required = false;
@@ -3124,7 +3126,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         || cuda_ctx->cuda_graph->disable_due_to_gpu_arch
         || cuda_ctx->cuda_graph->disable_due_to_too_many_updates
         || cuda_ctx->cuda_graph->disable_due_to_failed_graph_capture
-        || cuda_ctx->cuda_graph->disable_graph) {
+        || cuda_ctx->disable_graph) {
         use_cuda_graph = false;
     }
 
@@ -3852,10 +3854,7 @@ static void ggml_backend_cuda_set_allow_batched_add(ggml_backend_t backend, bool
     GGML_ASSERT(ggml_backend_is_cuda(backend));
 #ifdef USE_CUDA_GRAPH
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    if (cuda_ctx->cuda_graph == nullptr) {
-        cuda_ctx->cuda_graph.reset(new ggml_cuda_graph());
-    }
-    cuda_ctx->cuda_graph->allow_batched_add = allow;
+    cuda_ctx->allow_batched_add = allow;
 #else
     GGML_UNUSED(backend);
     GGML_UNUSED(allow);
@@ -3865,19 +3864,19 @@ static void ggml_backend_cuda_set_allow_batched_add(ggml_backend_t backend, bool
 // Extension setter reached via ggml_backend_reg_get_proc_address("ggml_backend_cuda_set_disable_graph").
 // When set to true on a backend instance, the NEXT ggml_backend_graph_compute call on
 // that backend bypasses the CUDA graph machinery entirely (no properties-cache update,
-// no capture, no instantiate). Intended for callers that alternate between a hot
-// graph (kept cached) and a rare "cold" graph that should NOT evict the hot graph's
-// cached instance — e.g. token2wav's gf_nonlast (hot) vs gf_last (cold).
-// The caller is expected to re-set it to false after the cold compute completes.
+// no capture, no instantiate).
+//
+// Historically used by token2wav to keep a rarely-used graph (gf_last) from evicting
+// a hot graph (gf_nonlast) in the single-slot CUDA graph cache. With the multi-slot
+// cache now keyed by cgraph->nodes[0] (see ggml_backend_cuda_context::cuda_graphs),
+// each graph owns its own slot and this escape hatch is no longer needed for that
+// pattern. The setter is kept for backwards compatibility with existing callers.
 // No-op when ggml-cuda was built without USE_CUDA_GRAPH.
 static void ggml_backend_cuda_set_disable_graph(ggml_backend_t backend, bool disable) {
     GGML_ASSERT(ggml_backend_is_cuda(backend));
 #ifdef USE_CUDA_GRAPH
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    if (cuda_ctx->cuda_graph == nullptr) {
-        cuda_ctx->cuda_graph.reset(new ggml_cuda_graph());
-    }
-    cuda_ctx->cuda_graph->disable_graph = disable;
+    cuda_ctx->disable_graph = disable;
 #else
     GGML_UNUSED(backend);
     GGML_UNUSED(disable);
