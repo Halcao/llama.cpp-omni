@@ -1052,12 +1052,23 @@ static const char * llama_loop_with_hidden_and_token(struct omni_context * ctx_o
 // TTS specific helper functions
 //
 
-// Helper function to get RNG from sampler chain for multinomial sampling
-// Uses common_sampler_get_rng() from common/sampling.cpp
-// This ensures audio_bos sampling uses the same RNG as non-audio_bos sampling
+// Helper function to get RNG for multinomial audio_bos sampling.
+//
+// Upstream llama.cpp removed common_sampler_get_rng (it used to expose the
+// sampler chain's internal std::mt19937 directly). To preserve deterministic
+// behaviour w.r.t. the user-supplied seed without poking sampler internals, we
+// keep a thread-local std::mt19937 seeded lazily from common_sampler_get_seed
+// on first use. The RNG is shared across all audio_bos samples on this thread
+// so each call advances the sequence, matching the original semantics.
 static std::mt19937* get_sampler_rng(struct common_sampler * smpl) {
-    void* rng_ptr = common_sampler_get_rng(smpl);
-    return static_cast<std::mt19937*>(rng_ptr);
+    static thread_local std::mt19937 tls_rng;
+    static thread_local bool         tls_rng_init = false;
+    if (!tls_rng_init) {
+        const uint32_t seed = smpl ? common_sampler_get_seed(smpl) : 0;
+        tls_rng = std::mt19937(seed != 0 ? seed : std::random_device{}());
+        tls_rng_init = true;
+    }
+    return &tls_rng;
 }
 
 // ==============================================================================
