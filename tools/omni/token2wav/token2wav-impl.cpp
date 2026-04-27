@@ -6678,13 +6678,94 @@ bool voc_hg2_runner::voc_hg2_runner_build_graph(ggml_context * ctx,
 bool voc_hg2_runner::voc_hg2_runner_eval(const std::vector<float> & speech_feat_bct,
                                          int64_t                    T_mel,
                                          std::vector<float> &       out_wave_bt,
-                                         int64_t &                  out_T_audio) const {
+                                         int64_t &                  out_T_audio) {
     std::vector<float> out_source_dummy;
     int64_t            out_T_source_dummy = 0;
     std::vector<float> empty_cache;
     return voc_hg2_runner_eval_stream(speech_feat_bct, T_mel, empty_cache, 0, out_wave_bt, out_T_audio,
                                       out_source_dummy, out_T_source_dummy);
 }
+// Persistent streaming state for voc_hg2_runner. Conceptually the vocoder
+// counterpart of flowGGUFModelRunner::streamSession (see L7318-7354): a single
+// long-lived ggml_context that owns metadata for one or more shape-specific
+// graphs, with each shape getting its own gallocr so that buffer addresses are
+// stable across chunks and ggml-cuda's per-cgraph CUDA Graph cache can replay.
+//
+// Why per-slot gallocr (not a single shared one): ggml_gallocr_alloc_graph
+// re-plans tensor offsets on every call, so reusing one gallocr across slots
+// would shift addresses every time a new shape appears, invalidating every
+// already-captured CUDA Graph. Independent gallocrs cost ~50-100MB extra
+// backing buffer per slot but keep each graph's tensor layout stable for life.
+struct voc_stream_session {
+    struct Slot {
+        int64_t T_mel = 0;
+        int64_t Tc    = 0;
+        ggml_gallocr_t galloc            = nullptr;
+        ggml_tensor *  speech_upload_tcb = nullptr;
+        ggml_tensor *  cache_source_t1_b = nullptr;
+        ggml_tensor *  out_wave_t_b      = nullptr;
+        ggml_tensor *  out_source_t1_b   = nullptr;
+        ggml_cgraph *  gf                = nullptr;
+        // Snapshot of model->hg2->gen.dsp.* / sine_gen.* tensor pointers as
+        // they were right after this slot's graph was built. dsp.window etc.
+        // are model-global pointers that get clobbered when a later slot's
+        // build_graph runs hg_stft16_params_init() / hg_sine_gen2_init() in
+        // the same shared ctx, so we cannot rely on them in eval. Each slot's
+        // graph nodes still reference its own stft/sine tensors (the pointer
+        // is captured at graph node construction); the snapshot lets us
+        // upload host const data to the correct slot's backend buffer on
+        // every chunk, matching the legacy per-chunk semantics exactly.
+        ggml_tensor *  dsp_window           = nullptr;
+        ggml_tensor *  dsp_window_sq        = nullptr;
+        ggml_tensor *  dsp_dft_cos_t        = nullptr;
+        ggml_tensor *  dsp_dft_sin_t        = nullptr;
+        ggml_tensor *  dsp_nyq_sign         = nullptr;
+        ggml_tensor *  dsp_istft_ola_kernel = nullptr;
+        ggml_tensor *  sine_harmonic_mul    = nullptr;
+    };
+
+    ggml_context *      ctx = nullptr;
+    std::vector<Slot>   slots;
+
+    // Soft cap on number of slots. Typical token2wav workloads need at most 4
+    // shapes (warmup-nonlast / warmup-final / steady-nonlast / steady-final).
+    // If we ever exceed this we log + fallback (still correct, just slower).
+    static constexpr size_t kMaxSlots = 8;
+
+    ~voc_stream_session() { clear(); }
+
+    void clear() {
+        for (Slot & s : slots) {
+            if (s.galloc) {
+                ggml_gallocr_free(s.galloc);
+                s.galloc = nullptr;
+            }
+        }
+        slots.clear();
+        if (ctx) {
+            ggml_free(ctx);
+            ctx = nullptr;
+        }
+    }
+
+    Slot * find(int64_t T_mel, int64_t Tc) {
+        for (Slot & s : slots) {
+            if (s.T_mel == T_mel && s.Tc == Tc) return &s;
+        }
+        return nullptr;
+    }
+};
+
+voc_hg2_runner::voc_hg2_runner()  = default;
+voc_hg2_runner::~voc_hg2_runner() = default;
+
+void voc_hg2_runner::voc_hg2_runner_reset_stream() {
+    if (sess_) {
+        sess_->clear();
+        sess_.reset();
+    }
+}
+
 bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speech_feat_bct,
                                                 int64_t                    T_mel,
                                                 const std::vector<float> & cache_source_bt1,
@@ -6692,8 +6773,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                                                 std::vector<float> &       out_wave_bt,
                                                 int64_t &                  out_T_audio,
                                                 std::vector<float> &       out_source_bt1,
-                                                int64_t &                  out_T_source) const {
-    if (!model || !model->hg2 || !model->backend || !model->galloc) {
+                                                int64_t &                  out_T_source) {
+    if (!model || !model->hg2 || !model->backend) {
         return false;
     }
     const int64_t B = 1;
@@ -6712,81 +6793,243 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         LOG_ERROR( "voc_hg2_runner_eval_stream: invalid cache_source_bt1 size\n");
         return false;
     }
-    ggml_init_params params{};
-    params.mem_size    = 2048ull * 1024ull * 1024ull;
-    params.mem_buffer  = nullptr;
-    params.no_alloc    = true;
-    ggml_context * ctx = ggml_init(params);
-    if (!ctx) {
-        return false;
+
+    // ---------- Host-backend (CPU / Metal) fast path: per-chunk ctx ----------
+    //
+    // The streamSession below is tuned for device backends where ggml-cuda's
+    // per-cgraph CUDA Graph cache turns repeated launches into pure replays.
+    // Host backends gain nothing from that (there is no graph cache) and
+    // actively suffer from holding ~50-100 MB of allocator state per slot in
+    // host RAM, which evicts otherwise-hot weight cache lines from L3 and
+    // measurably regresses voc.compute (CPU A/B 2026-04-27 saw +34% p50 on a
+    // dual-socket Xeon when streamSession was used unconditionally).
+    //
+    // Keeping bit-exactness by reproducing the legacy 79a667bc0 path verbatim.
+    if (!hg_backend_is_device(model->backend)) {
+        if (!model->galloc) {
+            return false;
+        }
+        ggml_init_params params{};
+        params.mem_size    = 2048ull * 1024ull * 1024ull;
+        params.mem_buffer  = nullptr;
+        params.no_alloc    = true;
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            return false;
+        }
+        ggml_tensor * speech_upload_tcb   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T_mel, C, B);
+        ggml_tensor * speech_feat_c80_t_b = ggml_cont(ctx, ggml_permute(ctx, speech_upload_tcb, 1, 0, 2, 3));
+        ggml_tensor * cache_source_t1_b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Tc, 1, B);
+        ggml_tensor * wave_t_b    = nullptr;
+        ggml_tensor * source_t1_b = nullptr;
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
+        {
+            omni::flow::profile::ScopeTimer _t("voc.build_alloc");
+            if (!voc_hg2_runner_build_graph(ctx, gf, speech_feat_c80_t_b, cache_source_t1_b, &wave_t_b,
+                                            &source_t1_b)) {
+                ggml_free(ctx);
+                return false;
+            }
+            if (!ggml_gallocr_alloc_graph(model->galloc, gf)) {
+                LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_gallocr_alloc_graph failed\n");
+                ggml_free(ctx);
+                return false;
+            }
+        }
+        {
+            omni::flow::profile::ScopeTimer _t("voc.upload");
+            model->hg2->gen.dsp.hg_stft16_params_upload_consts(model->backend);
+            model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(model->backend);
+            hg_backend_tensor_set(model->backend, speech_upload_tcb, speech_feat_bct.data(),
+                                  speech_feat_bct.size() * sizeof(float));
+            if (Tc > 0) {
+                hg_backend_tensor_set(model->backend, cache_source_t1_b, cache_source_bt1.data(),
+                                      cache_source_bt1.size() * sizeof(float));
+            }
+        }
+        if (omni::flow::profile::print_graph_enabled()) {
+            static std::atomic<bool> printed{ false };
+            bool                     expected = false;
+            if (printed.compare_exchange_strong(expected, true)) {
+                std::fprintf(stderr, "[profile] ===== vocoder (HiFiGAN2) graph =====\n");
+                std::fprintf(stderr, "[profile] n_nodes=%d\n", ggml_graph_n_nodes(gf));
+                ggml_graph_print(gf);
+            }
+        }
+        {
+            omni::flow::profile::ScopeTimer _t("voc.compute");
+            const ggml_status st = ggml_backend_graph_compute(model->backend, gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_backend_graph_compute failed\n");
+                ggml_free(ctx);
+                return false;
+            }
+        }
+        omni::flow::profile::ScopeTimer _download_timer("voc.download");
+        std::vector<float> wave_tb;
+        if (!hg_read_tensor_2d_tb_f32(model->backend, wave_t_b, wave_tb)) {
+            ggml_free(ctx);
+            return false;
+        }
+        out_T_audio = wave_t_b->ne[0];
+        hg_tb_to_bt(wave_tb, out_T_audio, B, out_wave_bt);
+        std::vector<float> source_tcb;
+        if (!hg_read_tensor_3d_tcb_f32(model->backend, source_t1_b, source_tcb)) {
+            ggml_free(ctx);
+            return false;
+        }
+        out_T_source = source_t1_b->ne[0];
+        std::vector<float> source_t1b((size_t) out_T_source);
+        for (int64_t t = 0; t < out_T_source; ++t) {
+            source_t1b[(size_t) t] = source_tcb[(size_t) t];
+        }
+        hg_t1b_to_bt1(source_t1b, out_T_source, B, out_source_bt1);
+        ggml_free(ctx);
+        return true;
     }
-    ggml_tensor * speech_upload_tcb   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T_mel, C, B);
-    ggml_tensor * speech_feat_c80_t_b = ggml_cont(ctx, ggml_permute(ctx, speech_upload_tcb, 1, 0, 2, 3));
-    ggml_tensor * cache_source_t1_b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Tc, 1, B);
-    ggml_tensor * wave_t_b    = nullptr;
-    ggml_tensor * source_t1_b = nullptr;
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
-    {
+
+    // ---------- Device-backend (CUDA) fast path: persistent streamSession ----
+
+    if (!sess_) {
+        sess_ = std::make_unique<voc_stream_session>();
+    }
+    if (!sess_->ctx) {
+        ggml_init_params params{};
+        // Keep the same 2 GiB virtual reservation as the legacy per-chunk
+        // allocator. Real residency is dominated by graph metadata + allocator
+        // bookkeeping (no_alloc=true means no tensor data lives in this ctx),
+        // so the cost of holding it across the whole stream is negligible.
+        params.mem_size    = 2048ull * 1024ull * 1024ull;
+        params.mem_buffer  = nullptr;
+        params.no_alloc    = true;
+        sess_->ctx = ggml_init(params);
+        if (!sess_->ctx) {
+            return false;
+        }
+    }
+
+    voc_stream_session::Slot * s = sess_->find(T_mel, Tc);
+    if (!s) {
+        if (sess_->slots.size() >= voc_stream_session::kMaxSlots) {
+            LOG_ERROR(
+                "voc_hg2_runner_eval_stream: slot cap %zu exceeded for shape (T_mel=%lld, Tc=%lld); "
+                "session shape distribution is wider than expected\n",
+                voc_stream_session::kMaxSlots, (long long) T_mel, (long long) Tc);
+            return false;
+        }
         omni::flow::profile::ScopeTimer _t("voc.build_alloc");
-        if (!voc_hg2_runner_build_graph(ctx, gf, speech_feat_c80_t_b, cache_source_t1_b, &wave_t_b, &source_t1_b)) {
-            ggml_free(ctx);
+        sess_->slots.emplace_back();
+        s = &sess_->slots.back();
+        s->T_mel = T_mel;
+        s->Tc    = Tc;
+
+        s->speech_upload_tcb = ggml_new_tensor_3d(sess_->ctx, GGML_TYPE_F32, T_mel, C, B);
+        ggml_tensor * speech_feat_c80_t_b =
+            ggml_cont(sess_->ctx, ggml_permute(sess_->ctx, s->speech_upload_tcb, 1, 0, 2, 3));
+        s->cache_source_t1_b = ggml_new_tensor_3d(sess_->ctx, GGML_TYPE_F32, Tc, 1, B);
+
+        s->gf = ggml_new_graph_custom(sess_->ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
+        if (!voc_hg2_runner_build_graph(sess_->ctx, s->gf, speech_feat_c80_t_b, s->cache_source_t1_b,
+                                        &s->out_wave_t_b, &s->out_source_t1_b)) {
+            sess_->clear();
             return false;
         }
-        if (!ggml_gallocr_alloc_graph(model->galloc, gf)) {
-            LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_gallocr_alloc_graph failed\n");
-            ggml_free(ctx);
+
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(model->backend);
+        s->galloc = ggml_gallocr_new(buft);
+        if (!s->galloc) {
+            LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_gallocr_new failed\n");
+            sess_->clear();
             return false;
+        }
+        if (!ggml_gallocr_alloc_graph(s->galloc, s->gf)) {
+            LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_gallocr_alloc_graph failed\n");
+            sess_->clear();
+            return false;
+        }
+
+        // Snapshot the per-slot dsp.* / sine_gen.* tensor pointers (set by
+        // hg_stft16_params_init() / hg_sine_gen2_init() inside build_graph)
+        // before a later slot's build clobbers the globals.
+        s->dsp_window           = model->hg2->gen.dsp.window;
+        s->dsp_window_sq        = model->hg2->gen.dsp.window_sq;
+        s->dsp_dft_cos_t        = model->hg2->gen.dsp.dft_cos_t;
+        s->dsp_dft_sin_t        = model->hg2->gen.dsp.dft_sin_t;
+        s->dsp_nyq_sign         = model->hg2->gen.dsp.nyq_sign;
+        s->dsp_istft_ola_kernel = model->hg2->gen.dsp.istft_ola_kernel;
+        s->sine_harmonic_mul    = model->hg2->gen.source_nsf.sine_gen.harmonic_mul;
+
+        if (omni::flow::profile::print_graph_enabled()) {
+            static std::atomic<bool> printed{ false };
+            bool                     expected = false;
+            if (printed.compare_exchange_strong(expected, true)) {
+                std::fprintf(stderr,
+                             "[profile] ===== vocoder (HiFiGAN2) graph (T_mel=%lld, Tc=%lld) =====\n",
+                             (long long) T_mel, (long long) Tc);
+                std::fprintf(stderr, "[profile] n_nodes=%d\n", ggml_graph_n_nodes(s->gf));
+                ggml_graph_print(s->gf);
+            }
         }
     }
+
     {
         omni::flow::profile::ScopeTimer _t("voc.upload");
-        model->hg2->gen.dsp.hg_stft16_params_upload_consts(model->backend);
-        model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(model->backend);
-        hg_backend_tensor_set(model->backend, speech_upload_tcb, speech_feat_bct.data(),
-                                                 speech_feat_bct.size() * sizeof(float));
+        // Upload the slot's stft/sine constants every chunk to match legacy
+        // semantics exactly: the original per-chunk path always called
+        // hg_stft16_params_upload_consts / hg_sine_gen2_upload_consts here.
+        // We route through the slot's own snapshot pointers because
+        // model->hg2->gen.dsp.* may now point at a different slot's tensors
+        // (clobbered by the most recent build_graph call). The host data in
+        // dsp.host_window / sine_gen.host_harmonic_mul etc. is shape-
+        // independent so it is shared across slots.
+        const auto & dsp = model->hg2->gen.dsp;
+        ggml_backend_tensor_set(s->dsp_window, dsp.host_window.data(), 0,
+                                dsp.host_window.size() * sizeof(float));
+        ggml_backend_tensor_set(s->dsp_window_sq, dsp.host_window_sq.data(), 0,
+                                dsp.host_window_sq.size() * sizeof(float));
+        ggml_backend_tensor_set(s->dsp_nyq_sign, dsp.host_nyq_sign.data(), 0,
+                                dsp.host_nyq_sign.size() * sizeof(float));
+        ggml_backend_tensor_set(s->dsp_dft_cos_t, dsp.host_dft_cos_t.data(), 0,
+                                dsp.host_dft_cos_t.size() * sizeof(float));
+        ggml_backend_tensor_set(s->dsp_dft_sin_t, dsp.host_dft_sin_t.data(), 0,
+                                dsp.host_dft_sin_t.size() * sizeof(float));
+        ggml_backend_tensor_set(s->dsp_istft_ola_kernel, dsp.host_istft_ola_kernel.data(), 0,
+                                dsp.host_istft_ola_kernel.size() * sizeof(float));
+        const auto & sg = model->hg2->gen.source_nsf.sine_gen;
+        ggml_backend_tensor_set(s->sine_harmonic_mul, sg.host_harmonic_mul.data(), 0,
+                                sg.host_harmonic_mul.size() * sizeof(float));
+        hg_backend_tensor_set(model->backend, s->speech_upload_tcb, speech_feat_bct.data(),
+                              speech_feat_bct.size() * sizeof(float));
         if (Tc > 0) {
-            hg_backend_tensor_set(model->backend, cache_source_t1_b, cache_source_bt1.data(),
-                                                     cache_source_bt1.size() * sizeof(float));
-        }
-    }
-    if (omni::flow::profile::print_graph_enabled()) {
-        static std::atomic<bool> printed{ false };
-        bool                     expected = false;
-        if (printed.compare_exchange_strong(expected, true)) {
-            std::fprintf(stderr, "[profile] ===== vocoder (HiFiGAN2) graph =====\n");
-            std::fprintf(stderr, "[profile] n_nodes=%d\n", ggml_graph_n_nodes(gf));
-            ggml_graph_print(gf);
+            hg_backend_tensor_set(model->backend, s->cache_source_t1_b, cache_source_bt1.data(),
+                                  cache_source_bt1.size() * sizeof(float));
         }
     }
     {
         omni::flow::profile::ScopeTimer _t("voc.compute");
-        const ggml_status st = ggml_backend_graph_compute(model->backend, gf);
+        const ggml_status st = ggml_backend_graph_compute(model->backend, s->gf);
         if (st != GGML_STATUS_SUCCESS) {
             LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_backend_graph_compute failed\n");
-            ggml_free(ctx);
             return false;
         }
     }
     omni::flow::profile::ScopeTimer _download_timer("voc.download");
     std::vector<float> wave_tb;
-    if (!hg_read_tensor_2d_tb_f32(model->backend, wave_t_b, wave_tb)) {
-        ggml_free(ctx);
+    if (!hg_read_tensor_2d_tb_f32(model->backend, s->out_wave_t_b, wave_tb)) {
         return false;
     }
-    out_T_audio = wave_t_b->ne[0];
+    out_T_audio = s->out_wave_t_b->ne[0];
     hg_tb_to_bt(wave_tb, out_T_audio, B, out_wave_bt);
     std::vector<float> source_tcb;
-    if (!hg_read_tensor_3d_tcb_f32(model->backend, source_t1_b, source_tcb)) {
-        ggml_free(ctx);
+    if (!hg_read_tensor_3d_tcb_f32(model->backend, s->out_source_t1_b, source_tcb)) {
         return false;
     }
-    out_T_source = source_t1_b->ne[0];
+    out_T_source = s->out_source_t1_b->ne[0];
     std::vector<float> source_t1b((size_t) out_T_source);
     for (int64_t t = 0; t < out_T_source; ++t) {
         source_t1b[(size_t) t] = source_tcb[(size_t) t];
     }
     hg_t1b_to_bt1(source_t1b, out_T_source, B, out_source_bt1);
-    ggml_free(ctx);
     return true;
 }
 }  // namespace vocoder
@@ -9083,6 +9326,7 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
 
 void Token2Wav::reset_stream() {
     t2m_.reset_stream();
+    voc_runner_.voc_hg2_runner_reset_stream();
     voc_mel_cache_bct_.clear();
     voc_cache_source_bt1_.clear();
     voc_Tc_ = 0;
