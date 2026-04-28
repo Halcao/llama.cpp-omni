@@ -7,6 +7,7 @@ const config = {
 	// Consult https://svelte.dev/docs/kit/integrations
 	// for more information about preprocessors
 	preprocess: [vitePreprocess(), mdsvex()],
+
 	kit: {
 		paths: {
 			relative: true
@@ -20,9 +21,16 @@ const config = {
 			strict: true
 		}),
 		output: {
-			bundleStrategy: 'inline'
+			bundleStrategy: 'single'
+		},
+		alias: {
+			$styles: 'src/styles'
+		},
+		version: {
+			name: 'llama-server-webui'
 		}
 	},
+
 	extensions: ['.svelte', '.svx']
 };
 

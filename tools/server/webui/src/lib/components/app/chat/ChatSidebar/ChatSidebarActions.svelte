@@ -1,9 +1,11 @@
 <script lang="ts">
-	import { Search, SquarePen, X, Download, Upload } from '@lucide/svelte';
+	import { Search, SquarePen, X } from '@lucide/svelte';
 	import { KeyboardShortcutInfo } from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
-	import { exportAllConversations, importConversations } from '$lib/stores/chat.svelte';
+	import { McpLogo } from '$lib/components/app';
+	import { SETTINGS_SECTION_TITLES } from '$lib/constants';
+	import { getChatSettingsDialogContext } from '$lib/contexts';
 
 	interface Props {
 		handleMobileSidebarItemClick: () => void;
@@ -19,6 +21,8 @@
 
 	let searchInput: HTMLInputElement | null = $state(null);
 
+	const chatSettingsDialog = getChatSettingsDialogContext();
+
 	function handleSearchModeDeactivate() {
 		isSearchModeActive = false;
 		searchQuery = '';
@@ -31,7 +35,7 @@
 	});
 </script>
 
-<div class="space-y-0.5">
+<div class="my-1 space-y-1">
 	{#if isSearchModeActive}
 		<div class="relative">
 			<Search class="absolute top-2.5 left-2 h-4 w-4 text-muted-foreground" />
@@ -51,13 +55,14 @@
 		</div>
 	{:else}
 		<Button
-			class="w-full justify-between hover:[&>kbd]:opacity-100"
+			class="w-full justify-between backdrop-blur-none! hover:[&>kbd]:opacity-100"
 			href="?new_chat=true#/"
 			onclick={handleMobileSidebarItemClick}
 			variant="ghost"
 		>
 			<div class="flex items-center gap-2">
 				<SquarePen class="h-4 w-4" />
+
 				New chat
 			</div>
 
@@ -65,7 +70,7 @@
 		</Button>
 
 		<Button
-			class="w-full justify-between hover:[&>kbd]:opacity-100"
+			class="w-full justify-between backdrop-blur-none! hover:[&>kbd]:opacity-100"
 			onclick={() => {
 				isSearchModeActive = true;
 			}}
@@ -73,38 +78,24 @@
 		>
 			<div class="flex items-center gap-2">
 				<Search class="h-4 w-4" />
-				Search conversations
+
+				Search
 			</div>
 
 			<KeyboardShortcutInfo keys={['cmd', 'k']} />
 		</Button>
 
 		<Button
-			class="w-full justify-start text-sm"
+			class="w-full justify-between backdrop-blur-none! hover:[&>kbd]:opacity-100"
 			onclick={() => {
-				importConversations().catch((err) => {
-					console.error('Import failed:', err);
-					// Optional: show toast or dialog
-				});
+				chatSettingsDialog.open(SETTINGS_SECTION_TITLES.MCP);
 			}}
 			variant="ghost"
 		>
 			<div class="flex items-center gap-2">
-				<Upload class="h-4 w-4" />
-				Import conversations
-			</div>
-		</Button>
+				<McpLogo class="h-4 w-4" />
 
-		<Button
-			class="w-full justify-start text-sm"
-			onclick={() => {
-				exportAllConversations();
-			}}
-			variant="ghost"
-		>
-			<div class="flex items-center gap-2">
-				<Download class="h-4 w-4" />
-				Export all conversations
+				MCP Servers
 			</div>
 		</Button>
 	{/if}
