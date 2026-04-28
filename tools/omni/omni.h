@@ -235,7 +235,25 @@ struct omni_context {
     // listen_prob_scale: 调整 <|listen|> token 的采样概率
     // 1.0: Python 默认
     float listen_prob_scale = 1.0f;
-    
+
+    // chunk_eos_logit_bias: 双工模式下对 <|chunk_eos|> / <|chunk_tts_eos|>
+    // 终止 token 的 logit 偏置，0.0f 关闭（默认）。
+    //
+    // 背景：上游 ggml-org/llama.cpp 的推理引擎重写后，相同 prompt + 相同采样
+    // 参数下 LLM 的 logits 会发生 ε 级（0.1 ~ 0.4）数值漂移。漂移本身无害，
+    // 但在 chunk 起手 iter-1 这种 logits 高度聚类的位置（CHUNK_EOS、TURN_EOS、
+    // TTS_EOS、LISTEN 等候选 logit 通常只差 0.5 以内），漂移会翻转 argmax 的
+    // 选择 —— 这正是 §6.6 中 master-upstream-sync 单 chunk 仅 16 token、
+    // origin/master 53 token 的根因（master 把 CHUNK_EOS 选成 top-1 触发提前终止）。
+    //
+    // 该字段提供运行时可调的防御性偏置：负值降低 chunk-级终止 token 概率，
+    // 让 argmax 在数值漂移环境下保持稳定。建议生产值 -2 ~ -5；调试用 -10 ~ -30。
+    // 0.0f 完全关闭（行为与未引入此字段前一致）。
+    //
+    // 注意：仅作用于 chunk_eos / chunk_tts_eos（chunk 边界），不作用于 turn_eos /
+    // tts_eos（轮次边界）—— 后者关系到对话结束语义，不能被偏置遮蔽。
+    float chunk_eos_logit_bias = 0.0f;
+
     // 是否启用双工模式
     // simplex: 单工模式，用户说完后模型回复，回复完用户再说
     // duplex: 双工模式，模型可以在任意时刻决定听/说切换
