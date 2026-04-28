@@ -1125,11 +1125,24 @@ ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
 }
 
+uint32_t llama_kv_cache::get_padding(const llama_cparams & cparams) {
+    // Used when LLAMA_LEGACY_KV_NUMERICS: FA vs non-FA alignment (see PR ggml-org/llama.cpp#7257).
+    return cparams.flash_attn ? 256u : 32u;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
-    // pad the n_kv value so that the graph remains constant across batches and can be reused
-    // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
+    // pad n_kv so attention tensor shapes stay stable across decode steps (graph reuse).
+#if defined(LLAMA_LEGACY_KV_NUMERICS)
+    // Legacy: n_pad from create_memory (via get_padding): 32 non-FA / 256 FA — stable vs older llama.cpp.
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[sinfo.strm[s]];
+
+        result = std::max(std::min(cells.size(), std::max(n_pad, GGML_PAD(cells.used_max_p1(), n_pad))), result);
+    }
+#else
+    // Upstream master: ctor often passes n_pad=1; bump alignment floor for CUDA kernels (PR #16812 discussion).
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -1137,6 +1150,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
     }
+#endif
 
     return result;
 }

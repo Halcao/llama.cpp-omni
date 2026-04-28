@@ -104,6 +104,8 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 
 # extra artifacts
+option(LLAMA_LEGACY_KV_NUMERICS "llama: legacy KV cell padding (get_padding 32/FA256 + get_n_kv without min-256); matches pre-upstream bit-identical CUDA attention. OFF = stock ggml-org master behavior." ON)
+
 option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_TOOLS    "llama: build tools"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})

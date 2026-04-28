@@ -53,6 +53,13 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (LLAMA_LEGACY_KV_NUMERICS)
+    target_compile_definitions(llama PRIVATE LLAMA_LEGACY_KV_NUMERICS)
+    message(STATUS "llama: LLAMA_LEGACY_KV_NUMERICS=ON (KV padding matches legacy bit-identical path)")
+else()
+    message(STATUS "llama: LLAMA_LEGACY_KV_NUMERICS=OFF (upstream master KV padding)")
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

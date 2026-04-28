@@ -19,6 +19,8 @@ struct llama_context;
 
 class llama_kv_cache : public llama_memory_i {
 public:
+    static uint32_t get_padding(const llama_cparams & cparams);
+
     struct stream_copy_info {
         bool empty() const {
             assert(ssrc.size() == sdst.size());
