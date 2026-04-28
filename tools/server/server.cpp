@@ -5764,6 +5764,8 @@ int main(int argc, char ** argv) {
         // 模型目录配置
         std::string model_dir = json_value(data, "model_dir", std::string("./tools/omni/convert/gguf/"));
         std::string tts_bin_dir = json_value(data, "tts_bin_dir", model_dir + "token2wav-gguf");
+        std::string tts_model_override = json_value(data, "tts_model", std::string(""));
+        std::string voxcpm_model_override = json_value(data, "voxcpm_model", std::string(""));
         
         // GPU 配置
         int tts_gpu_layers = json_value(data, "tts_gpu_layers", 99);
@@ -5785,7 +5787,12 @@ int main(int argc, char ** argv) {
         // 🔧 [修复] 使用正确的模型文件名格式 (MiniCPM-o-4_5)
         params.vpm_model = model_dir_normalized + "vision/MiniCPM-o-4_5-vision-F16.gguf";
         params.apm_model = model_dir_normalized + "audio/MiniCPM-o-4_5-audio-F16.gguf";
-        params.tts_model = model_dir_normalized + "tts/MiniCPM-o-4_5-tts-F16.gguf";
+        params.tts_model = tts_model_override.empty()
+            ? model_dir_normalized + "tts/MiniCPM-o-4_5-tts-F16.gguf"
+            : tts_model_override;
+        params.voxcpm_model = voxcpm_model_override.empty()
+            ? model_dir_normalized + "tts/voxcpm.gguf"
+            : voxcpm_model_override;
         // LLM 模型路径由 llama-server 启动时的 --model 参数指定，这里不需要设置
         // params.model.path 已经由 ctx_server.model 提供
         

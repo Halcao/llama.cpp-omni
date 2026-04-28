@@ -409,6 +409,7 @@ struct common_params {
 
     // omni model
     std::string tts_model            = ""; // model path
+    std::string voxcpm_model         = ""; // VoxCPM TTS model path
     std::string apm_model            = ""; // model path
     std::string vpm_model            = ""; // model path
 

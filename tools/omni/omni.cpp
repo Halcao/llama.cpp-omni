@@ -2,6 +2,7 @@
 #include "vision.h"
 #include "audition.h"
 #include "omni.h"
+#include "tts_backend.h"
 #include "token2wav/token2wav-impl.h"
 
 #include "llama.h"
@@ -3577,6 +3578,48 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->model = model;
     ctx_omni->ctx_sampler = sampler;
 
+#ifdef OMNI_TTS_BACKEND_VOXCPM
+    if (use_tts) {
+        print_with_timestamp("=== omni_init: initializing TTS backend '%s'\n", omni_tts_backend_name());
+        ctx_omni->tts_backend = create_omni_tts_backend();
+        OmniTtsBackendOptions backend_options;
+        backend_options.model_path = params->voxcpm_model.empty() ? params->tts_model : params->voxcpm_model;
+        backend_options.legacy_tts_bin_dir = tts_bin_dir;
+        backend_options.device = token2wav_device;
+        backend_options.n_threads = params->cpuparams.n_threads;
+        backend_options.gpu_layers = tts_gpu_layers;
+        std::string backend_error;
+        if (!ctx_omni->tts_backend->init(ctx_omni, backend_options, backend_error)) {
+            LOG_ERR("%s: error: failed to init TTS backend '%s': %s\n",
+                    __func__, omni_tts_backend_name(), backend_error.c_str());
+            llama_free(ctx_llama);
+            llama_free_model(model);
+            common_sampler_free(sampler);
+            delete ctx_omni;
+            return NULL;
+        }
+    }
+#else
+    if (use_tts) {
+        ctx_omni->tts_backend = create_omni_tts_backend();
+        OmniTtsBackendOptions backend_options;
+        backend_options.model_path = params->tts_model;
+        backend_options.legacy_tts_bin_dir = tts_bin_dir;
+        backend_options.device = token2wav_device;
+        backend_options.n_threads = params->cpuparams.n_threads;
+        backend_options.gpu_layers = tts_gpu_layers;
+        std::string backend_error;
+        if (!ctx_omni->tts_backend->init(ctx_omni, backend_options, backend_error)) {
+            LOG_ERR("%s: error: failed to init TTS backend '%s': %s\n",
+                    __func__, omni_tts_backend_name(), backend_error.c_str());
+            llama_free(ctx_llama);
+            llama_free_model(model);
+            common_sampler_free(sampler);
+            delete ctx_omni;
+            return NULL;
+        }
+    }
+
     if (use_tts && !params->tts_model.empty()) {
         print_with_timestamp("=== omni_init: loading TTS model\n");
         // 使用TTS专用的模型加载函数，支持独立的GPU层数设置
@@ -3655,6 +3698,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             print_with_timestamp("Projector: failed to load, will use fallback implementation\n");
         }
     }
+#endif
 
     ctx_omni->omni_emb.resize((64 + 10 + 1) * 4096); // temp fix for omni embed
     ctx_omni->audio_emb.resize((10 + 1) * 4096); // temp fix for audio embed
@@ -3721,6 +3765,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         LOG_INF("init t2w....");
         ctx_omni->t2w_thread_info = new T2WThreadInfo(25);  // Queue size of 10 chunks
         
+#ifndef OMNI_TTS_BACKEND_VOXCPM
         // Initialize C++ Token2Wav session
         // Try to load token2wav GGUF models from {model_dir}/token2wav-gguf/
         // Fallback to tools/omni/token2wav-gguf if not found
@@ -3947,6 +3992,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         } else {
             print_with_timestamp("Token2Wav: 使用 C++ 实现\n");
         }
+#else
+        print_with_timestamp("Token2Wav: skipped for VoxCPM TTS backend\n");
+#endif
     }
     ctx_omni->async = true;
     
@@ -4045,7 +4093,7 @@ bool omni_tts_queues_empty(struct omni_context * ctx_omni) {
         std::lock_guard<std::mutex> lock(ctx_omni->t2w_thread_info->mtx);
         t2w_empty = ctx_omni->t2w_thread_info->queue.empty();
     }
-    return tts_empty && t2w_empty;
+    return tts_empty && t2w_empty && !ctx_omni->tts_backend_busy.load();
 }
 
 // 停止所有线程（发送信号，不等待）
@@ -5513,6 +5561,117 @@ static void merge_wav_files(const std::string& output_dir, int num_chunks) {
         LOG_WRN("TTS: failed to merge WAV files (tried ffmpeg and sox). Please install ffmpeg or sox.\n");
     }
 }
+
+#ifdef OMNI_TTS_BACKEND_VOXCPM
+void tts_thread_func_voxcpm(struct omni_context * ctx_omni, common_params *) {
+    print_with_timestamp("TTS thread (VoxCPM backend) started\n");
+    int chunk_idx = 0;
+    bool llm_finish = false;
+    std::string pending_text;
+
+    auto create_dir = [](const std::string& dir_path) {
+        if (!cross_platform_mkdir_p(dir_path)) {
+            LOG_ERR("Failed to create output directory: %s\n", dir_path.c_str());
+            return false;
+        }
+        return true;
+    };
+
+    auto round_dir = [&]() {
+        if (ctx_omni->duplex_mode) {
+            return ctx_omni->base_output_dir;
+        }
+        char buf[512];
+        snprintf(buf, sizeof(buf), "%s/round_%03d", ctx_omni->base_output_dir.c_str(), ctx_omni->simplex_round_idx);
+        return std::string(buf);
+    };
+
+    while (tts_thread_running) {
+        std::unique_lock<std::mutex> lock(ctx_omni->tts_thread_info->mtx);
+        auto& queue = ctx_omni->tts_thread_info->queue;
+        ctx_omni->tts_thread_info->cv.wait(lock, [&] {
+            return !queue.empty() || !tts_thread_running || ctx_omni->break_event.load();
+        });
+
+        if (!tts_thread_running) {
+            break;
+        }
+
+        if (ctx_omni->break_event.load()) {
+            while (!queue.empty()) {
+                LLMOut * llm_out = queue.front();
+                queue.pop();
+                delete llm_out;
+            }
+            pending_text.clear();
+            llm_finish = false;
+            chunk_idx = 0;
+            ctx_omni->tts_backend_busy.store(false);
+            lock.unlock();
+            if (ctx_omni->tts_backend) {
+                ctx_omni->tts_backend->reset(ctx_omni);
+            }
+            continue;
+        }
+
+        while (!queue.empty()) {
+            LLMOut * llm_out = queue.front();
+            queue.pop();
+            if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
+                pending_text += llm_out->text;
+            }
+            llm_finish |= llm_out->llm_finish;
+            delete llm_out;
+        }
+        lock.unlock();
+        ctx_omni->tts_thread_info->cv.notify_all();
+
+        if (pending_text.empty() && !llm_finish) {
+            continue;
+        }
+
+        std::string current_round_dir = round_dir();
+        std::string tts_wav_output_dir = current_round_dir + "/tts_wav";
+        create_dir(current_round_dir + "/tts_txt");
+        create_dir(current_round_dir + "/llm_debug");
+        create_dir(tts_wav_output_dir);
+
+        if (!pending_text.empty()) {
+            std::string wav_path = tts_wav_output_dir + "/tts_output_chunk_" + std::to_string(chunk_idx) + ".wav";
+            std::string backend_error;
+            print_with_timestamp("VoxCPM TTS: synthesizing chunk %d to %s\n", chunk_idx, wav_path.c_str());
+            ctx_omni->tts_backend_busy.store(true);
+            bool synth_ok = ctx_omni->tts_backend &&
+                ctx_omni->tts_backend->synthesize_text(ctx_omni, pending_text, wav_path, llm_finish, backend_error);
+            if (!synth_ok) {
+                LOG_ERR("VoxCPM TTS: failed to synthesize chunk %d: %s\n", chunk_idx, backend_error.c_str());
+            } else {
+                print_with_timestamp("VoxCPM TTS: wrote %s\n", wav_path.c_str());
+                ++chunk_idx;
+            }
+            ctx_omni->tts_backend_busy.store(false);
+            pending_text.clear();
+        }
+
+        if (llm_finish) {
+            ctx_omni->speek_done = true;
+            ctx_omni->warmup_done = true;
+            speek_cv.notify_all();
+            merge_wav_files(tts_wav_output_dir, chunk_idx);
+            if (!ctx_omni->duplex_mode) {
+                ctx_omni->simplex_round_idx++;
+            }
+            if (ctx_omni->tts_backend) {
+                ctx_omni->tts_backend->reset(ctx_omni);
+            }
+            llm_finish = false;
+            chunk_idx = 0;
+        }
+    }
+
+    print_with_timestamp("TTS thread (VoxCPM backend) stopped\n");
+}
+#endif
 
 // ==============================================================================
 // TTS Thread Function - Duplex Mode
@@ -8845,6 +9004,10 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
             }
             if (ctx_omni->use_tts && !ctx_omni->tts_thread.joinable()) {
                 tts_thread_running = true;
+#ifdef OMNI_TTS_BACKEND_VOXCPM
+                ctx_omni->tts_thread = std::thread(tts_thread_func_voxcpm, ctx_omni, ctx_omni->params);
+                print_with_timestamp("create tts thread (VoxCPM backend) success\n");
+#else
                 // 🔧 [双工模式] 根据 duplex_mode 选择不同的 TTS 线程函数
                 if (ctx_omni->duplex_mode) {
                     ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
@@ -8853,14 +9016,17 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
                     ctx_omni->tts_thread = std::thread(tts_thread_func, ctx_omni, ctx_omni->params);
                     print_with_timestamp("create tts thread (simplex mode) success\n");
                 }
+#endif
             }
             
+#ifndef OMNI_TTS_BACKEND_VOXCPM
             // Start T2W thread if TTS is enabled and thread is not already running
             if (ctx_omni->use_tts && ctx_omni->t2w_thread_info && !ctx_omni->t2w_thread.joinable()) {
                 t2w_thread_running = true;
                 ctx_omni->t2w_thread = std::thread(t2w_thread_func, ctx_omni, ctx_omni->params);
                 print_with_timestamp("create t2w thread success\n");
             }
+#endif
         }
 
     }
@@ -9046,6 +9212,10 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         // 🔧 确保线程已启动（如果 prefill 是同步模式执行的，线程可能还没启动）
         if (!ctx_omni->tts_thread.joinable() && ctx_omni->use_tts) {
             tts_thread_running = true;
+#ifdef OMNI_TTS_BACKEND_VOXCPM
+            ctx_omni->tts_thread = std::thread(tts_thread_func_voxcpm, ctx_omni, ctx_omni->params);
+            print_with_timestamp("stream_decode: create tts thread (VoxCPM backend)\n");
+#else
             if (ctx_omni->duplex_mode) {
                 ctx_omni->tts_thread = std::thread(tts_thread_func_duplex, ctx_omni, ctx_omni->params);
                 print_with_timestamp("stream_decode: create tts thread (duplex mode)\n");
@@ -9053,11 +9223,14 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 ctx_omni->tts_thread = std::thread(tts_thread_func, ctx_omni, ctx_omni->params);
                 print_with_timestamp("stream_decode: create tts thread (simplex mode)\n");
             }
+#endif
         }
         if (!ctx_omni->t2w_thread.joinable() && ctx_omni->use_tts && ctx_omni->t2w_thread_info) {
+#ifndef OMNI_TTS_BACKEND_VOXCPM
             t2w_thread_running = true;
             ctx_omni->t2w_thread = std::thread(t2w_thread_func, ctx_omni, ctx_omni->params);
             print_with_timestamp("stream_decode: create t2w thread\n");
+#endif
         }
         
         ctx_omni->need_speek = true;

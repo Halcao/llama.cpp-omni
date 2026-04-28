@@ -29,7 +29,9 @@
 #include <fstream>
 #include <functional>
 
+#ifndef OMNI_TTS_BACKEND_VOXCPM
 #define MINIAUDIO_IMPLEMENTATION
+#endif
 #ifndef OMNI_AUDIO_DEBUG
 #   define MA_NO_ENCODING
 #endif

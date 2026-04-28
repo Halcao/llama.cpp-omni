@@ -4,6 +4,32 @@ find_package(Threads REQUIRED)
 
 # CoreML / ANE support option
 option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
+set(OMNI_TTS_BACKEND "legacy" CACHE STRING "Omni TTS backend: legacy or voxcpm")
+set_property(CACHE OMNI_TTS_BACKEND PROPERTY STRINGS legacy voxcpm)
+if (NOT OMNI_TTS_BACKEND STREQUAL "legacy" AND NOT OMNI_TTS_BACKEND STREQUAL "voxcpm")
+    message(FATAL_ERROR "OMNI_TTS_BACKEND must be one of: legacy, voxcpm")
+endif()
+
+set(OMNI_TTS_BACKEND_SOURCES tts_backend.h)
+if (OMNI_TTS_BACKEND STREQUAL "legacy")
+    list(APPEND OMNI_TTS_BACKEND_SOURCES tts_backend_legacy.cpp)
+else()
+    set(VOXCPM_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../VoxCPM.cpp" CACHE PATH "Path to VoxCPM.cpp source tree")
+    if (NOT EXISTS "${VOXCPM_SOURCE_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR "OMNI_TTS_BACKEND=voxcpm requires VOXCPM_SOURCE_DIR to point at VoxCPM.cpp")
+    endif()
+    set(VOXCPM_USE_EXTERNAL_GGML ON CACHE BOOL "Use llama.cpp ggml target for VoxCPM" FORCE)
+    set(VOXCPM_BUILD_EXAMPLES OFF CACHE BOOL "Build VoxCPM examples" FORCE)
+    set(VOXCPM_BUILD_BENCHMARK OFF CACHE BOOL "Build VoxCPM benchmarks" FORCE)
+    set(VOXCPM_BUILD_TESTS OFF CACHE BOOL "Build VoxCPM tests" FORCE)
+    set(VOXCPM_EXTERNAL_GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../ggml" CACHE PATH "Parent ggml source for VoxCPM" FORCE)
+    set(VOXCPM_USE_EXTERNAL_MINIAUDIO ON CACHE BOOL "Use omni-linked miniaudio symbols for VoxCPM" FORCE)
+    add_subdirectory("${VOXCPM_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/voxcpm")
+    target_include_directories(voxcpm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor")
+    list(APPEND OMNI_TTS_BACKEND_SOURCES
+        tts_backend_voxcpm.cpp
+        "${VOXCPM_SOURCE_DIR}/third_party/miniaudio/miniaudio.c")
+endif()
 
 add_library(omni
             omni.cpp
@@ -17,6 +43,7 @@ add_library(omni
             token2wav/token2wav-impl.h
             token2wav/token2wav.cpp
             token2wav/token2wav.h
+            ${OMNI_TTS_BACKEND_SOURCES}
             )
 
 # Add CoreML related files when enabled
@@ -41,6 +68,13 @@ target_include_directories(omni PUBLIC  .)
 target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
 target_compile_features   (omni PRIVATE cxx_std_17)
+
+if (OMNI_TTS_BACKEND STREQUAL "legacy")
+    target_compile_definitions(omni PUBLIC OMNI_TTS_BACKEND_LEGACY=1)
+else()
+    target_compile_definitions(omni PUBLIC OMNI_TTS_BACKEND_VOXCPM=1)
+    target_link_libraries(omni PUBLIC voxcpm)
+endif()
 
 # Link CoreML and Accelerate frameworks when CoreML is enabled
 if(ENABLE_COREML)

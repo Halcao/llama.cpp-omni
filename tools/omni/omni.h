@@ -28,6 +28,8 @@ class Token2WavSession;
 }
 }
 
+class OmniTtsBackend;
+
 //
 // omni ctx
 //
@@ -254,6 +256,7 @@ struct omni_context {
     int use_tts = false;
     std::string tts_bin_dir = "";
     std::string ref_audio_path = "";  // 参考音频路径（用于音色克隆）
+    std::unique_ptr<OmniTtsBackend> tts_backend;
     
     // 🔧 [高清/高刷模式] 
     // high_image: 高清模式，max_slice_nums 设置为 2，vision 可以看到更多细节
@@ -345,6 +348,7 @@ struct omni_context {
     std::unique_ptr<omni::flow::Token2WavSession> token2wav_session;
     bool token2wav_initialized = false;
     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
+    std::atomic<bool> tts_backend_busy{false};
     
     // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
     // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
