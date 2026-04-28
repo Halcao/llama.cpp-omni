@@ -8551,6 +8551,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
 
+#if defined(LLAMA_LEGACY_KV_NUMERICS)
+                    const uint32_t kv_mem_pad = llama_kv_cache::get_padding(cparams);
+#endif
+
                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](int32_t il) {
                             if (il >= (int32_t) hparams.n_layer_kv_from_start) {
@@ -8575,7 +8579,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_ctx_seq,
                                 cparams.n_seq_max,
                                 cparams.n_ubatch,
+#if defined(LLAMA_LEGACY_KV_NUMERICS)
+                                kv_mem_pad,
+#else
                                 1,
+#endif
                                 nullptr,
                                 reuse);
                     } else {
@@ -8590,7 +8598,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,
                                 cparams.n_seq_max,
+#if defined(LLAMA_LEGACY_KV_NUMERICS)
+                                kv_mem_pad,
+#else
                                 1,
+#endif
                                 hparams.n_swa,
                                 hparams.swa_type,
                                 nullptr,
