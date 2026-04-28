@@ -64,6 +64,7 @@ static inline void omni_try_enable_cuda_batched_add(ggml_backend_t backend) {
     omni_set_cuda_batched_add(backend, /*allow=*/true);
 }
 
+
 #if ENABLE_STDERR_LOG
 #ifndef LOG_ERROR
 #define LOG_ERROR(...) std::fprintf(stderr, __VA_ARGS__)
@@ -6766,6 +6767,72 @@ void voc_hg2_runner::voc_hg2_runner_reset_stream() {
     }
 }
 
+bool voc_hg2_runner::voc_hg2_runner_warmup_streamSession_for_duplex() {
+    if (!model || !model->hg2 || !model->backend) {
+        return false;
+    }
+    // Host backends use the legacy per-chunk path inside
+    // voc_hg2_runner_eval_stream(); they neither populate sess_ nor benefit
+    // from CUDA Graph caching, so warmup would just allocate a session that
+    // immediately gets bypassed. Skip cleanly.
+    if (!hg_backend_is_device(model->backend)) {
+        return true;
+    }
+
+    // Predicted dominant shapes for full 28-token (kDt = WINDOW_SIZE) windows
+    // fed by the omni duplex t2w_thread:
+    //   - chunk 0 (no source-cache yet):    T_mel = 28*2 = 56, Tc = 0
+    //   - steady chunk (with mel + source): T_mel = 56 + kMelCacheLen(8) = 64,
+    //                                       Tc   = kSourceCacheLen (8 * 480 = 3840)
+    // Last-window-of-turn shapes (M < 28) are not warmed up here; they appear
+    // at most once per speak turn, will fall through to the existing
+    // lazy-build path in voc_hg2_runner_eval_stream(), and the resulting
+    // single cudaMalloc per session is rare enough not to deterministically
+    // race with LLM CUDA Graph capture. The two warmed shapes cover ~95% of
+    // chunks in a typical duplex run.
+    constexpr int64_t kVocWarmupTMelChunk0     = 28 * 2;
+    constexpr int64_t kVocWarmupMelCacheLen    = 8;
+    constexpr int64_t kVocWarmupSamplesPerMel  = 480;
+    constexpr int64_t kVocWarmupTMelSteady     = kVocWarmupTMelChunk0 + kVocWarmupMelCacheLen;
+    constexpr int64_t kVocWarmupTcSteady       = kVocWarmupMelCacheLen * kVocWarmupSamplesPerMel;
+    constexpr int64_t kVocWarmupMelChannels    = 80;
+
+    auto warmup_one = [this](int64_t T_mel, int64_t Tc) -> bool {
+        std::vector<float> dummy_speech_feat((size_t)(kVocWarmupMelChannels * T_mel), 0.0f);
+        std::vector<float> dummy_cache_source((size_t) Tc, 0.0f);
+        std::vector<float> wave_out;
+        int64_t            T_audio_out = 0;
+        std::vector<float> source_out;
+        int64_t            T_source_out = 0;
+        return voc_hg2_runner_eval_stream(dummy_speech_feat, T_mel,
+                                          dummy_cache_source, Tc,
+                                          wave_out, T_audio_out,
+                                          source_out, T_source_out);
+    };
+
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    if (!warmup_one(kVocWarmupTMelChunk0, 0)) {
+        LOG_ERROR("voc_hg2_runner_warmup_streamSession_for_duplex: chunk0 shape (T_mel=%lld, Tc=0) failed\n",
+                  (long long) kVocWarmupTMelChunk0);
+        return false;
+    }
+    if (!warmup_one(kVocWarmupTMelSteady, kVocWarmupTcSteady)) {
+        LOG_ERROR("voc_hg2_runner_warmup_streamSession_for_duplex: steady shape (T_mel=%lld, Tc=%lld) failed\n",
+                  (long long) kVocWarmupTMelSteady, (long long) kVocWarmupTcSteady);
+        return false;
+    }
+    const auto   t1     = clock::now();
+    const double dt_ms  = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::fprintf(stderr,
+                 "voc_hg2_runner: streamSession warmup done in %.1f ms (slots: chunk0=%lldx0, steady=%lldx%lld)\n",
+                 dt_ms,
+                 (long long) kVocWarmupTMelChunk0,
+                 (long long) kVocWarmupTMelSteady,
+                 (long long) kVocWarmupTcSteady);
+    return true;
+}
+
 bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speech_feat_bct,
                                                 int64_t                    T_mel,
                                                 const std::vector<float> & cache_source_bt1,
@@ -9186,6 +9253,11 @@ bool Token2Wav::start_stream_with_prompt_cache_gguf(const std::string & prompt_c
             "Token2Wav.start_stream_with_prompt_cache_gguf: Token2Mel.start_stream_with_prompt_cache_gguf failed\n");
         return false;
     }
+    if (!voc_runner_.voc_hg2_runner_warmup_streamSession_for_duplex()) {
+        LOG_ERROR(
+            "Token2Wav.start_stream_with_prompt_cache_gguf: voc_hg2_runner_warmup_streamSession_for_duplex failed\n");
+        return false;
+    }
     return true;
 }
 
@@ -9203,6 +9275,10 @@ bool Token2Wav::start_stream_with_prompt(const Token2Mel::PromptBundle & prompt,
 
     if (!t2m_.start_stream_with_prompt(prompt, n_timesteps, temperature)) {
         LOG_ERROR( "Token2Wav.start_stream_with_prompt: Token2Mel.start_stream_with_prompt failed\n");
+        return false;
+    }
+    if (!voc_runner_.voc_hg2_runner_warmup_streamSession_for_duplex()) {
+        LOG_ERROR("Token2Wav.start_stream_with_prompt: voc_hg2_runner_warmup_streamSession_for_duplex failed\n");
         return false;
     }
     return true;

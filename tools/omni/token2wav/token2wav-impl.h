@@ -1987,6 +1987,17 @@ struct voc_hg2_runner {
     // voc_hg2_runner_eval_stream() call.
     void voc_hg2_runner_reset_stream();
 
+    // Pre-build streamSession slots for the dominant (T_mel, Tc) shapes used
+    // by the duplex t2w pipeline (full 28-token windows). Triggers all the
+    // graph allocator's cudaMalloc work synchronously at start-of-stream
+    // time, so the async t2w thread does not race with concurrent CUDA Graph
+    // capture in the LLM thread (cudaMalloc is illegal while a stream is
+    // capturing on the same context, which previously surfaced as
+    // "operation not permitted when stream is capturing" + LLM KV cache
+    // inconsistency aborts on GPU duplex). No-op on host backends; they use
+    // a separate per-chunk legacy path that doesn't need warmup.
+    bool voc_hg2_runner_warmup_streamSession_for_duplex();
+
     std::unique_ptr<voc_stream_session> sess_;
 };
 }  // namespace vocoder
