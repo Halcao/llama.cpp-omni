@@ -1950,7 +1950,14 @@ struct voc_hg2_model {
                                       int32_t             num_threads_in);
     void voc_hg2_model_free();
 };
+struct voc_stream_session;
+
 struct voc_hg2_runner {
+    voc_hg2_runner();
+    ~voc_hg2_runner();
+    voc_hg2_runner(const voc_hg2_runner &)             = delete;
+    voc_hg2_runner & operator=(const voc_hg2_runner &) = delete;
+
     voc_hg2_model * model = nullptr;
     bool voc_hg2_runner_build_graph(ggml_context * ctx,
                                     ggml_cgraph *  gf,
@@ -1961,7 +1968,12 @@ struct voc_hg2_runner {
     bool voc_hg2_runner_eval(const std::vector<float> & speech_feat_bct,
                              int64_t                    T_mel,
                              std::vector<float> &       out_wave_bt,
-                             int64_t &                  out_T_audio) const;
+                             int64_t &                  out_T_audio);
+    // Streaming entry point. Reuses a per-runner streamSession that holds
+    // persistent backend tensors and graphs (one per (T_mel, Tc) shape pair),
+    // so that ggml-cuda's CUDA Graph cache can actually replay across chunks
+    // instead of re-capturing every call (which is what happens when ctx /
+    // cgraph are rebuilt on the stack each chunk).
     bool voc_hg2_runner_eval_stream(const std::vector<float> & speech_feat_bct,
                                     int64_t                    T_mel,
                                     const std::vector<float> & cache_source_bt1,
@@ -1969,7 +1981,24 @@ struct voc_hg2_runner {
                                     std::vector<float> &       out_wave_bt,
                                     int64_t &                  out_T_audio,
                                     std::vector<float> &       out_source_bt1,
-                                    int64_t &                  out_T_source) const;
+                                    int64_t &                  out_T_source);
+    // Drop the persistent session (release ctx, gallocs, slots). Safe to call
+    // any time; a fresh session will be lazily created on the next
+    // voc_hg2_runner_eval_stream() call.
+    void voc_hg2_runner_reset_stream();
+
+    // Pre-build streamSession slots for the dominant (T_mel, Tc) shapes used
+    // by the duplex t2w pipeline (full 28-token windows). Triggers all the
+    // graph allocator's cudaMalloc work synchronously at start-of-stream
+    // time, so the async t2w thread does not race with concurrent CUDA Graph
+    // capture in the LLM thread (cudaMalloc is illegal while a stream is
+    // capturing on the same context, which previously surfaced as
+    // "operation not permitted when stream is capturing" + LLM KV cache
+    // inconsistency aborts on GPU duplex). No-op on host backends; they use
+    // a separate per-chunk legacy path that doesn't need warmup.
+    bool voc_hg2_runner_warmup_streamSession_for_duplex();
+
+    std::unique_ptr<voc_stream_session> sess_;
 };
 }  // namespace vocoder
 }  // namespace omni
