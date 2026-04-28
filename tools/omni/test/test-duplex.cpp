@@ -379,6 +379,15 @@ int main(int argc, char ** argv) {
     ctx_omni->async = true;
     ctx_omni->ref_audio_path = ref_audio_path;
 
+    // [§6.6 数值漂移防御] 通过 OMNI_CHUNK_EOS_LOGIT_BIAS 环境变量调节
+    // chunk-边界终止 token 的 logit 偏置。默认 0.0f（关闭，行为不变）。
+    // 见 omni.h::chunk_eos_logit_bias 注释了解背景与建议值。
+    if (const char * env = std::getenv("OMNI_CHUNK_EOS_LOGIT_BIAS")) {
+        float bias = (float) std::atof(env);
+        ctx_omni->chunk_eos_logit_bias = bias;
+        printf("  chunk_eos_logit_bias: %.3f (from OMNI_CHUNK_EOS_LOGIT_BIAS)\n", bias);
+    }
+
     // 执行测试
     if (run_test) {
         printf("=== Running duplex test case ===\n");

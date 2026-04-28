@@ -1005,6 +1005,25 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
             if (ctx_omni->special_token_tts_pad >= 0) {
                 logits[ctx_omni->special_token_tts_pad] = -INFINITY;
             }
+
+            // 3. 🔧 [§6.6 数值漂移防御] chunk-边界终止 token 的 logit 偏置
+            // 上游 ggml 推理引擎重写后 LLM 输出存在 ε 级数值漂移；在 chunk
+            // 起手 iter-1 这种 logits 高度聚类的位置（CHUNK_EOS / TURN_EOS /
+            // TTS_EOS / LISTEN 候选差距通常 < 0.5），漂移会翻转 argmax，
+            // 导致 master-upstream-sync 把 CHUNK_EOS 选为 top-1 触发提前
+            // 终止（实测 16 vs 53 token，-70%）。
+            //
+            // 这里仅对 chunk_eos / chunk_tts_eos 施加偏置（默认 0.0f = 关闭，
+            // 行为不变）。turn_eos / tts_eos 是轮次级终止，不参与防御以保留
+            // 对话结束语义；listen 由 listen_prob_scale 单独管控。
+            if (ctx_omni->chunk_eos_logit_bias != 0.0f) {
+                if (ctx_omni->special_token_chunk_eos >= 0) {
+                    logits[ctx_omni->special_token_chunk_eos] += ctx_omni->chunk_eos_logit_bias;
+                }
+                if (ctx_omni->special_token_chunk_tts_eos >= 0) {
+                    logits[ctx_omni->special_token_chunk_tts_eos] += ctx_omni->chunk_eos_logit_bias;
+                }
+            }
         }
     }
     
